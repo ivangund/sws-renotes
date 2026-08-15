@@ -29,16 +29,18 @@
 // - if REAPER >= v4.55pre2 use MarkProjectDirty(), otherwise creates undo point for each key stroke (!) to fix:
 //   * SaveExtensionConfig() that is not called when there is no proj mods but some notes have been entered..
 //   * missing updates on project switches
-// - OSX: no action help support (SWELL's GetPrivateProfileSection assumes key=value)
 // - clicking the empty area of the tcp does not remove focus (important for refresh)
 // - undo does not restore caret position
 // TODO?
 // - take changed => title not updated
 // - drag-drop text?
-// - use action_help_t? (not finished according to Cockos)
 // - handle concurent item/project notes updates?
 
 #include "stdafx.h"
+
+#ifdef _WIN32
+#pragma comment(lib, "comctl32.lib")
+#endif
 
 #include "SnM.h"
 #include "SnM_Dlg.h"
@@ -47,6 +49,8 @@
 #include "SnM_Track.h"
 #include "SnM_Util.h"
 #include "SnM_Window.h"
+
+#include "../cfillion/cfillion.hpp"
 
 #include <WDL/localize/localize.h>
 #include <WDL/projectcontext.h>
@@ -57,27 +61,32 @@
 #define UPDATE_TIMER				1
 
 enum {
-#ifdef WANT_ACTION_HELP
-  SET_ACTION_HELP_FILE_MSG = 0xF001,
-  WRAP_MSG,
-  SAVE_GLOBAL_NOTES_MSG,
-#else
   WRAP_MSG = 0xF001,
   SAVE_GLOBAL_NOTES_MSG,
-#endif
+  LINK_ACTOR_MSG,
+  UNLINK_ACTOR_MSG,
+  CHANGE_COLOR_MSG,
+  COLORED_REGIONS_MSG,
+  HIDE_REGIONS_MSG,
+  HIDE_ACTOR_LIST_MSG,
+  DISPLAY_ACTOR_PREFIX_MSG,
+  IMPORT_ROLES_MSG,
+  EXPORT_ROLES_MSG,
+  ENABLE_ALL_MSG,
+  DISABLE_ALL_MSG,
+  COPY_MARKERS_MSG,
+  COPY_ROLE_DISTRIBUTION_MSG,
+  COPY_CURRENT_PHRASE_MSG,
   LAST_MSG // keep as last item!
 };
 
 enum {
   BTNID_LOCK=LAST_MSG,
   CMBID_TYPE,
+  CMBID_REGION,
   TXTID_LABEL,
-#ifdef WANT_ACTION_HELP
-  BTNID_ALR,
-  BTNID_ACTIONLIST,
-#endif
   BTNID_IMPORT_SUB,
-  BTNID_EXPORT_SUB,
+  BTNID_CLEAR_SUBS,
   TXTID_BIG_NOTES
 };
 
@@ -86,36 +95,44 @@ enum {
   NO_REFRESH
 };
 
+int GenerateActorColor(const char *actorName);
+bool ImportAssFile(const char *_fn);
+bool ImportSubRipFile(const char *_fn);
+
 
 SNM_WindowManager<NotesWnd> g_notesWndMgr(NOTES_WND_ID);
 
 SWSProjConfig<WDL_PtrList_DOD<SNM_TrackNotes> > g_SNM_TrackNotes;
-SWSProjConfig<WDL_PtrList_DOD<SNM_RegionSubtitle> > g_pRegionSubs; // for markers too..
+SWSProjConfig<WDL_PtrList_DOD<SNM_RegionSubtitle> > g_pRegionSubs;
+SWSProjConfig<WDL_PtrList_DOD<SNM_Actor> > g_actors;
 SWSProjConfig<WDL_FastString> g_prjNotes; // extra project notes
 // global notes #647, saved in <REAPER Resource Path>/SWS_GlobalNotes.txt 
 // (no SWSProjConfig, one instance across all projects, i.e. global)
 WDL_FastString g_globalNotes; 
 bool g_globalNotesDirty = false;
+bool g_coloredRegions = true;
+bool g_displayActorInPrefix = true;
+bool g_hideRegions = false;
+bool g_hideActorList = false;
+static bool g_pendingRegionRecreation = false;
+SWSProjConfig<WDL_PtrList_DOD<SNM_Actor> > g_importedRoleActors;
+
+void CleanupStaleActors();
+void ClearAllSubtitles();
+void UpdateRegionColors();
+void HideAllRegions();
+void ShowAllRegions();
+bool ExportRolesFile(const char *fn);
+bool ImportRolesFile(const char *fn);
 
 int g_notesType = -1;
 int g_prevNotesType = -1;
-bool g_locked = false;
+bool g_locked = true;
 char g_lastText[MAX_HELP_LENGTH] = "";
 char g_lastImportSubFn[SNM_MAX_PATH] = "";
-char g_lastExportSubFn[SNM_MAX_PATH] = "";
-char g_actionHelpFn[SNM_MAX_PATH] = "";
+char g_lastRolesFn[SNM_MAX_PATH] = "";
 char g_notesBigFontName[64] = SNM_DYN_FONT_NAME;
 bool g_wrapText=false;
-
-// used for action help updates tracking
-#ifdef WANT_ACTION_HELP
-//JFB TODO: cleanup when we'll be able to access all sections & custom ids
-int g_lastActionListSel = -1;
-int g_lastActionListCmd = 0;
-char g_lastActionSection[SNM_MAX_SECTION_NAME_LEN] = "";
-char g_lastActionCustId[SNM_MAX_ACTION_CUSTID_LEN] = "";
-char g_lastActionDesc[SNM_MAX_ACTION_NAME_LEN] = "";
-#endif
 
 // other vars for updates tracking
 double g_lastMarkerPos = -1.0;
@@ -149,12 +166,14 @@ SNM_TrackNotes *SNM_TrackNotes::find(MediaTrack *track)
 // S&M windows lazy init: below's "" prevents registering the SWS' screenset callback
 // (use the S&M one instead - already registered via SNM_WindowManager::Init())
 NotesWnd::NotesWnd()
-	: SWS_DockWnd(IDD_SNM_NOTES, __LOCALIZE("Notes","sws_DLG_152"), ""),
+	: SWS_DockWnd(IDD_SNM_NOTES, __LOCALIZE("ReNotes","sws_DLG_152"), ""),
 	m_edit { nullptr }, // NotesWnd may be constructed without being open
-	m_settingText { false }
+    m_settingText { false},
+    m_actorListView{nullptr},
+    m_contextMenuActor{nullptr}
 {
 	m_id.Set(NOTES_WND_ID);
-	// must call SWS_DockWnd::Init() to restore parameters and open the window if necessary
+	// Must call SWS_DockWnd::Init() to restore parameters and open the window if necessary.
 	Init();
 }
 
@@ -183,6 +202,10 @@ void NotesWnd::OnInitDlg()
 	m_resize.init_item(IDC_EDIT1, 0.0, 0.0, 1.0, 1.0);
 	m_resize.init_item(IDC_EDIT2, 0.0, 0.0, 1.0, 1.0);
 
+#ifdef _WIN32
+  DragAcceptFiles(m_hwnd, TRUE);
+#endif
+
 	SetWrapText(g_wrapText);
 
 	LICE_CachedFont* font = SNM_GetThemeFont();
@@ -195,42 +218,53 @@ void NotesWnd::OnInitDlg()
 
 	m_cbType.SetID(CMBID_TYPE);
 	m_cbType.SetFont(font);
-	m_cbType.AddItem(__LOCALIZE("Track notes","sws_DLG_152"));
-	m_cbType.AddItem(__LOCALIZE("Item notes","sws_DLG_152"));
-	m_cbType.AddItem(__LOCALIZE("Project notes","sws_DLG_152"));
-	m_cbType.AddItem(__LOCALIZE("Extra project notes","sws_DLG_152"));
-	m_cbType.AddItem(__LOCALIZE("Global notes", "sws_DLG_152"));
+	m_cbType.AddItem(__LOCALIZE("Заметки дорожки","sws_DLG_152"));
+	m_cbType.AddItem(__LOCALIZE("Заметки айтема","sws_DLG_152"));
+	m_cbType.AddItem(__LOCALIZE("Заметки проекта","sws_DLG_152"));
+	m_cbType.AddItem(__LOCALIZE("Доп. заметки проекта","sws_DLG_152"));
+	m_cbType.AddItem(__LOCALIZE("Глобальные заметки", "sws_DLG_152"));
 	m_cbType.AddItem("<SEP>");
-	m_cbType.AddItem(__LOCALIZE("Marker names","sws_DLG_152"));
-	m_cbType.AddItem(__LOCALIZE("Region names","sws_DLG_152"));
-	m_cbType.AddItem(__LOCALIZE("Marker/Region names","sws_DLG_152"));
-	m_cbType.AddItem("<SEP>");
-	m_cbType.AddItem(__LOCALIZE("Marker subtitles","sws_DLG_152"));
-	m_cbType.AddItem(__LOCALIZE("Region subtitles","sws_DLG_152"));
-	m_cbType.AddItem(__LOCALIZE("Marker/Region subtitles","sws_DLG_152"));
-#if defined(_WIN32) && defined(WANT_ACTION_HELP)
-	m_cbType.AddItem("<SEP>");
-	m_cbType.AddItem(__LOCALIZE("Action help","sws_DLG_152"));
-#endif
+	m_cbType.AddItem(__LOCALIZE("Субтитры","sws_DLG_152"));
 	m_parentVwnd.AddChild(&m_cbType);
 	// ...the selected item is set through SetType() below
+
+  m_cbRegion.SetID(CMBID_REGION);
+  m_cbRegion.SetFont(font);
+  m_parentVwnd.AddChild(&m_cbRegion);
 
 	m_txtLabel.SetID(TXTID_LABEL);
 	m_txtLabel.SetFont(font);
 	m_parentVwnd.AddChild(&m_txtLabel);
-#ifdef WANT_ACTION_HELP
-	m_btnAlr.SetID(BTNID_ALR);
-	m_parentVwnd.AddChild(&m_btnAlr);
-
-	m_btnActionList.SetID(BTNID_ACTIONLIST);
-	m_parentVwnd.AddChild(&m_btnActionList);
-#endif
 
 	m_btnImportSub.SetID(BTNID_IMPORT_SUB);
 	m_parentVwnd.AddChild(&m_btnImportSub);
 
-	m_btnExportSub.SetID(BTNID_EXPORT_SUB);
-	m_parentVwnd.AddChild(&m_btnExportSub);
+  m_btnClearSubs.SetID(BTNID_CLEAR_SUBS);
+	m_parentVwnd.AddChild(&m_btnClearSubs);
+
+
+#ifdef _WIN32
+  HWND actorListHwnd = CreateWindowEx(0,
+                                      WC_LISTVIEW,
+                                      "",
+                                      WS_CHILD | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS |
+                                      LVS_NOCOLUMNHEADER | LVS_NOSORTHEADER,
+                                      0,
+                                      0,
+                                      150,
+                                      200,
+                                      m_hwnd,
+                                      NULL,
+                                      g_hInst,
+                                      NULL);
+  ListView_SetExtendedListViewStyle(actorListHwnd, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
+  HIMAGELIST hImgList = ImageList_Create(1, 34, ILC_COLOR, 1, 0);
+  ListView_SetImageList(actorListHwnd, hImgList, LVSIL_SMALL);
+#else
+  HWND actorListHwnd = GetDlgItem(m_hwnd, IDC_LIST3);
+#endif
+  m_actorListView = new ActorListView(actorListHwnd, NULL);
+  m_pLists.Add(m_actorListView);
 
 	m_bigNotes.SetID(TXTID_BIG_NOTES);
 	m_bigNotes.SetFontName(g_notesBigFontName);
@@ -252,9 +286,19 @@ void NotesWnd::OnDestroy()
 /* see OnTimer()
 	UnregisterToMarkerRegionUpdates(&m_mkrRgnListener);
 */
+#ifdef _WIN32
+  if (m_actorListView) {
+    HIMAGELIST hImgList = ListView_GetImageList(m_actorListView->GetHWND(), LVSIL_SMALL);
+    if (hImgList)
+      ImageList_Destroy(hImgList);
+  }
+#endif
 	g_prevNotesType = -1;
 	m_cbType.Empty();
+  m_cbRegion.Empty();
+  m_overlappingRegionIds.Resize(0);
 	m_edit = nullptr;
+  m_actorListView = nullptr;
 }
 
 // note: no diff with current type, init would fail otherwise
@@ -306,21 +350,10 @@ void NotesWnd::RefreshGUI()
 			if (g_trNote)
 				bHide = false;
 			break;
-		case SNM_NOTES_MKR_NAME:
-		case SNM_NOTES_RGN_NAME:
-		case SNM_NOTES_MKRRGN_NAME:
-		case SNM_NOTES_MKR_SUB:
 		case SNM_NOTES_RGN_SUB:
-		case SNM_NOTES_MKRRGN_SUB:
-			if (g_lastMarkerRegionId > 0)
+			if (g_hideRegions ? g_lastMarkerRegionId >= 0 : g_lastMarkerRegionId > 0)
 				bHide = false;
 			break;
-#ifdef WANT_ACTION_HELP
-		case SNM_NOTES_ACTION_HELP:
-			if (g_lastActionListSel >= 0)
-				bHide = false; // for copy/paste even if "Custom: ..."
-			break;
-#endif
 	}
 	ShowWindow(m_edit, bHide || g_locked ? SW_HIDE : SW_SHOW);
 	m_parentVwnd.RequestRedraw(NULL); // the meat!
@@ -367,6 +400,367 @@ void NotesWnd::SetWrapText(const bool wrap)
 #endif
 }
 
+static const char *GetLinkedActorForDisplay(const char *actorName) {
+  if (!g_displayActorInPrefix || !actorName || !*actorName || !strcmp(actorName, "?"))
+    return NULL;
+  WDL_PtrList_DOD<SNM_Actor> *actors = g_actors.Get();
+  for (int i = 0; i < actors->GetSize(); i++) {
+    SNM_Actor *a = actors->Get(i);
+    if (!strcmp(a->GetName(), actorName) && a->HasLinkedActor())
+      return a->GetLinkedActorName();
+  }
+  return NULL;
+}
+
+static void BuildRegionName(WDL_String *out, const char *actor, const char *notes) {
+  if (actor && *actor && strcmp(actor, "?")) {
+    const char *linked = GetLinkedActorForDisplay(actor);
+    if (linked)
+      out->SetFormatted(512, "%s (%s) %s", linked, actor, notes);
+    else
+      out->SetFormatted(512, "(%s) %s", actor, notes);
+  } else {
+    out->Set(notes);
+  }
+  char *p = out->Get();
+  while (*p) {
+    if (*p == '\r' || *p == '\n') *p = ' ';
+    p++;
+  }
+  out->Ellipsize(0, 64);
+}
+
+static void AppendDisplayLine(WDL_FastString *out, const char *actorName, const char *notes) {
+  if (actorName && *actorName) {
+    const char *linked = GetLinkedActorForDisplay(actorName);
+    if (linked)
+      out->AppendFormatted(MAX_HELP_LENGTH, "%s (%s) %s", linked, actorName, notes);
+    else
+      out->AppendFormatted(MAX_HELP_LENGTH, "(%s) %s", actorName, notes);
+  } else {
+    out->Append(notes);
+  }
+}
+
+void DeleteActorRegions(const char *actorName) {
+  WDL_PtrList_DOD<SNM_RegionSubtitle> *subs = g_pRegionSubs.Get();
+  for (int i = subs->GetSize() - 1; i >= 0; i--) {
+    SNM_RegionSubtitle *sub = subs->Get(i);
+    if (!strcmp(sub->GetActor(), actorName) && sub->IsValid()) {
+      double pos, endPos;
+      if (EnumMarkerRegionById(NULL, sub->GetId(), NULL, &pos, &endPos, NULL, NULL, NULL) >= 0)
+        sub->SetTimes(pos, endPos);
+      int idx = GetMarkerRegionIndexFromId(NULL, sub->GetId());
+      if (idx >= 0)
+        DeleteProjectMarkerByIndex(NULL, idx);
+      sub->SetId(-1);
+    }
+  }
+}
+
+void RecreateActorRegions(const char *actorName) {
+  if (g_hideRegions) return;
+  SNM_Actor *actor = NULL;
+  WDL_PtrList_DOD<SNM_Actor> *actors = g_actors.Get();
+  for (int i = 0; i < actors->GetSize(); i++)
+    if (!strcmp(actors->Get(i)->GetName(), actorName)) {
+      actor = actors->Get(i);
+      break;
+    }
+  if (!actor) return;
+
+  WDL_PtrList_DOD<SNM_RegionSubtitle> *subs = g_pRegionSubs.Get();
+  for (int i = 0; i < subs->GetSize(); i++) {
+    SNM_RegionSubtitle *sub = subs->Get(i);
+    if (!strcmp(sub->GetActor(), actorName) && !sub->IsValid()) {
+      int color = g_coloredRegions ? actor->GetEffectiveColor() : 0;
+      WDL_String regionName;
+      BuildRegionName(&regionName, sub->GetActor(), sub->GetNotes());
+      int num = AddProjectMarker2(NULL,
+                                  true,
+                                  sub->GetStartTime(),
+                                  sub->GetEndTime(),
+                                  regionName.Get(),
+                                  -1,
+                                  color);
+      if (num >= 0) {
+        int newId = MakeMarkerRegionId(num, true);
+        sub->SetId(newId);
+      }
+    }
+  }
+  UpdateTimeline();
+}
+
+void UpdateRegionColors() {
+  if (g_hideRegions) return;
+  WDL_PtrList_DOD<SNM_RegionSubtitle> *subs = g_pRegionSubs.Get();
+  WDL_PtrList_DOD<SNM_Actor> *actors = g_actors.Get();
+
+  PreventUIRefresh(1);
+
+  for (int i = 0; i < subs->GetSize(); i++) {
+    SNM_RegionSubtitle *sub = subs->Get(i);
+    if (!sub->IsValid())
+      continue;
+
+    int color = 0;
+    if (g_coloredRegions) {
+      for (int j = 0; j < actors->GetSize(); j++) {
+        if (!strcmp(actors->Get(j)->GetName(), sub->GetActor())) {
+          color = actors->Get(j)->GetEffectiveColor();
+          break;
+        }
+      }
+    }
+
+    double pos, endPos;
+    int num;
+    if (EnumMarkerRegionById(NULL, sub->GetId(), NULL, &pos, &endPos, NULL, &num, NULL) >= 0) {
+      int idx = GetMarkerRegionIndexFromId(NULL, sub->GetId());
+      if (idx >= 0)
+        DeleteProjectMarkerByIndex(NULL, idx);
+      WDL_String regionName;
+      BuildRegionName(&regionName, sub->GetActor(), sub->GetNotes());
+      int newNum = AddProjectMarker2(NULL, true, pos, endPos, regionName.Get(), -1, color);
+      if (newNum >= 0)
+        sub->SetId(MakeMarkerRegionId(newNum, true));
+    }
+  }
+
+  PreventUIRefresh(-1);
+  UpdateTimeline();
+}
+
+static void FormatSubTime(double seconds, char *buf, int bufSize) {
+  int totalSec = (int) (seconds + 0.5);
+  int h = totalSec / 3600;
+  int m = (totalSec % 3600) / 60;
+  int s = totalSec % 60;
+  if (h > 0)
+    snprintf(buf, bufSize, "%d:%02d:%02d", h, m, s);
+  else
+    snprintf(buf, bufSize, "%d:%02d", m, s);
+}
+
+struct MarkerEntry {
+  double pos;
+  WDL_FastString text;
+};
+
+static void CopyMarkersToClipboard(HWND hwnd) {
+  WDL_PtrList_DOD<SNM_RegionSubtitle> *subs = g_pRegionSubs.Get();
+  WDL_PtrList_DOD<SNM_Actor> *actors = g_actors.Get();
+  if (!subs->GetSize()) return;
+
+  int enumIdx = 0;
+  bool isRgn;
+  double mPos;
+  WDL_TypedBuf<double> markerPositions;
+  while ((enumIdx = EnumProjectMarkers2(NULL, enumIdx, &isRgn, &mPos, NULL, NULL, NULL))) {
+    if (!isRgn)
+      markerPositions.Add(mPos);
+  }
+  struct SubEntry {
+    double startTime;
+    double endTime;
+    const char *text;
+    const char *linkedActorName;
+  };
+
+  WDL_PtrList_DOD<WDL_PtrList_DOD<SubEntry> > groups;
+  WDL_PtrList_DOD<WDL_FastString> groupNames;
+
+  WDL_PtrList_DOD<SubEntry> unlinkedGroup;
+  WDL_FastString unlinkedName("");
+
+  for (int i = 0; i < subs->GetSize(); i++) {
+    SNM_RegionSubtitle *sub = subs->Get(i);
+    if (!sub->IsValid()) continue;
+
+    double pos, endPos;
+    if (EnumMarkerRegionById(NULL, sub->GetId(), NULL, &pos, &endPos, NULL, NULL, NULL) < 0)
+      continue;
+
+    bool hasMarker = false;
+    for (int m = 0; m < markerPositions.GetSize(); m++) {
+      double mp = markerPositions.Get()[m];
+      if (mp >= pos && mp < endPos) {
+        hasMarker = true;
+        break;
+      }
+    }
+    if (!hasMarker) continue;
+
+    const char *linkedName = "";
+    const char *actorName = sub->GetActor();
+    if (actorName[0]) {
+      for (int j = 0; j < actors->GetSize(); j++) {
+        SNM_Actor *a = actors->Get(j);
+        if (!strcmp(a->GetName(), actorName)) {
+          if (a->HasLinkedActor())
+            linkedName = a->GetLinkedActorName();
+          break;
+        }
+      }
+    }
+
+    SubEntry *entry = new SubEntry();
+    entry->startTime = pos;
+    entry->endTime = endPos;
+    entry->text = sub->GetNotes();
+    entry->linkedActorName = linkedName;
+
+    if (!linkedName[0]) {
+      unlinkedGroup.Add(entry);
+    } else {
+      WDL_PtrList_DOD<SubEntry> *targetGroup = NULL;
+      for (int g = 0; g < groupNames.GetSize(); g++) {
+        if (!strcmp(groupNames.Get(g)->Get(), linkedName)) {
+          targetGroup = groups.Get(g);
+          break;
+        }
+      }
+      if (!targetGroup) {
+        targetGroup = new WDL_PtrList_DOD<SubEntry>();
+        groups.Add(targetGroup);
+        groupNames.Add(new WDL_FastString(linkedName));
+      }
+      targetGroup->Add(entry);
+    }
+  }
+
+  WDL_FastString output;
+
+  auto appendGroup = [&output](WDL_PtrList_DOD<SubEntry> *grp) {
+    for (int a = 0; a < grp->GetSize() - 1; a++) {
+      for (int b = a + 1; b < grp->GetSize(); b++) {
+        if (grp->Get(a)->startTime > grp->Get(b)->startTime) {
+          SubEntry *tmp = grp->Get(a);
+          grp->Set(a, grp->Get(b));
+          grp->Set(b, tmp);
+        }
+      }
+    }
+    for (int j = 0; j < grp->GetSize(); j++) {
+      SubEntry *e = grp->Get(j);
+      char startBuf[32], endBuf[32];
+      FormatSubTime(e->startTime, startBuf, sizeof(startBuf));
+      FormatSubTime(e->endTime, endBuf, sizeof(endBuf));
+
+      WDL_FastString text(e->text);
+      for (int p = 0; p < text.GetLength();) {
+        char c = text.Get()[p];
+        bool isBreak = false;
+        int breakLen = 0;
+        if (c == '\\' && p + 1 < text.GetLength() && (text.Get()[p + 1] == 'N' || text.Get()[p + 1]
+          == 'n')) {
+          isBreak = true;
+          breakLen = 2;
+        } else if (c == '\r' && p + 1 < text.GetLength() && text.Get()[p + 1] == '\n') {
+          isBreak = true;
+          breakLen = 2;
+        } else if (c == '\n' || c == '\r') {
+          isBreak = true;
+          breakLen = 1;
+        }
+        if (isBreak) {
+          int start = p;
+          while (start > 0 && text.Get()[start - 1] == ' ') start--;
+          int end = p + breakLen;
+          while (end < text.GetLength() && text.Get()[end] == ' ') end++;
+          text.DeleteSub(start, end - start);
+          text.Insert(" ", start);
+          p = start + 1;
+        } else {
+          p++;
+        }
+      }
+
+      output.AppendFormatted(512, "%s-%s %s\n", startBuf, endBuf, text.Get());
+    }
+  };
+
+  if (unlinkedGroup.GetSize() > 0) {
+    appendGroup(&unlinkedGroup);
+  }
+
+  for (int g = 0; g < groups.GetSize(); g++) {
+    if (output.GetLength() > 0)
+      output.Append("\n");
+    output.AppendFormatted(256, "%s\n", groupNames.Get(g)->Get());
+    appendGroup(groups.Get(g));
+  }
+
+  if (output.GetLength() > 0 && output.Get()[output.GetLength() - 1] == '\n')
+    output.DeleteSub(output.GetLength() - 1, 1);
+
+  if (output.GetLength() > 0)
+    CF_SetClipboard(output.Get());
+  else
+    MessageBox(hwnd,
+               __LOCALIZE("Нет маркеров внутри регионов.", "sws_DLG_152"),
+               __LOCALIZE("ReNotes", "sws_DLG_152"),
+               MB_OK);
+
+  for (int i = 0; i < unlinkedGroup.GetSize(); i++)
+    delete unlinkedGroup.Get(i);
+  for (int g = 0; g < groups.GetSize(); g++) {
+    for (int i = 0; i < groups.Get(g)->GetSize(); i++)
+      delete groups.Get(g)->Get(i);
+  }
+}
+
+static WDL_DLGRET LinkActorDlgProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lParam) {
+  if (INT_PTR r = SNM_HookThemeColorsMessage(hwndDlg, uMsg, wParam, lParam))
+    return r;
+
+  switch (uMsg) {
+    case WM_INITDIALOG: {
+      SetWindowLongPtr(hwndDlg, GWLP_USERDATA, lParam);
+      SetDlgItemText(hwndDlg, -1, __LOCALIZE("Имя актёра:", "sws_DLG_152"));
+      SetDlgItemText(hwndDlg, IDCANCEL, __LOCALIZE("Отменить", "sws_DLG_152"));
+      HWND combo = GetDlgItem(hwndDlg, IDC_COMBO);
+      WDL_UTF8_HookComboBox(combo);
+      WDL_PtrList_DOD<SNM_Actor> *actors = g_actors.Get();
+      WDL_PtrList<const char> added;
+      for (int i = 0; i < actors->GetSize(); i++) {
+        SNM_Actor *a = actors->Get(i);
+        if (a->HasLinkedActor()) {
+          const char *name = a->GetLinkedActorName();
+          bool found = false;
+          for (int j = 0; j < added.GetSize(); j++) {
+            if (!strcmp(added.Get(j), name)) {
+              found = true;
+              break;
+            }
+          }
+          if (!found) {
+            SendMessage(combo, CB_ADDSTRING, 0, (LPARAM) name);
+            added.Add(name);
+          }
+        }
+      }
+      SetWindowPos(hwndDlg, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+      return 0;
+    }
+    case WM_COMMAND:
+      switch (LOWORD(wParam)) {
+        case IDOK: {
+          char *buf = (char *) GetWindowLongPtr(hwndDlg, GWLP_USERDATA);
+          GetDlgItemText(hwndDlg, IDC_COMBO, buf, 256);
+          EndDialog(hwndDlg, 1);
+          return 0;
+        }
+        case IDCANCEL:
+          EndDialog(hwndDlg, 0);
+          return 0;
+      }
+      break;
+  }
+  return 0;
+}
+
 void NotesWnd::OnCommand(WPARAM wParam, LPARAM lParam)
 {
 	switch (LOWORD(wParam))
@@ -376,11 +770,6 @@ void NotesWnd::OnCommand(WPARAM wParam, LPARAM lParam)
 			if (HIWORD(wParam)==EN_CHANGE && !m_settingText)
 				SaveCurrentText(g_notesType, MarkProjectDirty==NULL); // MarkProjectDirty() avail. since v4.55pre2
 			break;
-#ifdef WANT_ACTION_HELP
-		case SET_ACTION_HELP_FILE_MSG:
-			SetActionHelpFilename(NULL);
-			break;
-#endif
 		case WRAP_MSG:
 			SetWrapText(!g_wrapText);
 			break;
@@ -392,34 +781,248 @@ void NotesWnd::OnCommand(WPARAM wParam, LPARAM lParam)
 			if (!HIWORD(wParam))
 				ToggleLock();
 			break;
-#ifdef WANT_ACTION_HELP
-		case BTNID_ALR:
-			if (!HIWORD(wParam) && *g_lastActionCustId && !IsMacroOrScript(g_lastActionDesc))
-			{
-				char link[256] = "";
-				char sectionURL[SNM_MAX_SECTION_NAME_LEN] = "";
-				if (GetSectionURL(true, g_lastActionSection, sectionURL, SNM_MAX_SECTION_NAME_LEN))
-					if (snprintfStrict(link, sizeof(link), "http://www.cockos.com/wiki/index.php/%s_%s", sectionURL, g_lastActionCustId) > 0)
-						ShellExecute(m_hwnd, "open", link , NULL, NULL, SW_SHOWNORMAL);
-			}
-			else
-				ShellExecute(m_hwnd, "open", "http://wiki.cockos.com/wiki/index.php/Action_List_Reference" , NULL, NULL, SW_SHOWNORMAL);
-			break;
-		case BTNID_ACTIONLIST:
-			Main_OnCommand(40605, 0);
-			break;
-#endif
 		case BTNID_IMPORT_SUB:
 			ImportSubTitleFile(NULL);
 			break;
-		case BTNID_EXPORT_SUB:
-			ExportSubTitleFile(NULL);
+		case BTNID_CLEAR_SUBS:
+      if (!HIWORD(wParam))
+        ClearAllSubtitlesAction(NULL);
+      break;
+    case COLORED_REGIONS_MSG:
+      ToggleColoredRegions(NULL);
+      break;
+    case HIDE_REGIONS_MSG:
+      ToggleHideRegions(NULL);
+      break;
+    case HIDE_ACTOR_LIST_MSG:
+      ToggleHideActorList(NULL);
+      break;
+    case DISPLAY_ACTOR_PREFIX_MSG:
+      ToggleDisplayActorInPrefix(NULL);
+      break;
+    case ENABLE_ALL_MSG:
+      EnableAllActors(NULL);
+      break;
+    case DISABLE_ALL_MSG:
+      DisableAllActors(NULL);
+      break;
+    case COPY_MARKERS_MSG:
+      CopyMarkersToClipboard(GetHWND());
+      break;
+    case COPY_CURRENT_PHRASE_MSG: {
+      if (m_overlappingRegionIds.GetSize() <= 0) break;
+      WDL_FastString output;
+      for (int i = 0; i < m_overlappingRegionIds.GetSize(); i++) {
+        SNM_RegionSubtitle *sub = NULL;
+        double pos, endPos;
+        if (g_hideRegions) {
+          int subIdx = m_overlappingRegionIds.Get()[i];
+          sub = g_pRegionSubs.Get()->Get(subIdx);
+          if (!sub) continue;
+          pos = sub->GetStartTime();
+          endPos = sub->GetEndTime();
+        } else {
+          int regId = m_overlappingRegionIds.Get()[i];
+          for (int j = 0; j < g_pRegionSubs.Get()->GetSize(); j++) {
+            if (g_pRegionSubs.Get()->Get(j)->GetId() == regId) {
+              sub = g_pRegionSubs.Get()->Get(j);
+              break;
+            }
+          }
+          if (!sub) continue;
+          if (EnumMarkerRegionById(NULL, regId, NULL, &pos, &endPos, NULL, NULL, NULL) < 0)
+            continue;
+        }
+        {
+            char startBuf[32], endBuf[32];
+            FormatSubTime(pos, startBuf, sizeof(startBuf));
+            FormatSubTime(endPos, endBuf, sizeof(endBuf));
+
+            WDL_FastString text(sub->GetNotes());
+            for (int p = 0; p < text.GetLength();) {
+              char c = text.Get()[p];
+              bool isBreak = false;
+              int breakLen = 0;
+              if (c == '\\' && p + 1 < text.GetLength() && (text.Get()[p + 1] == 'N' || text.Get()[p + 1] == 'n')) {
+                isBreak = true;
+                breakLen = 2;
+              } else if (c == '\r' && p + 1 < text.GetLength() && text.Get()[p + 1] == '\n') {
+                isBreak = true;
+                breakLen = 2;
+              } else if (c == '\n' || c == '\r') {
+                isBreak = true;
+                breakLen = 1;
+              }
+              if (isBreak) {
+                int start = p;
+                while (start > 0 && text.Get()[start - 1] == ' ') start--;
+                int end = p + breakLen;
+                while (end < text.GetLength() && text.Get()[end] == ' ') end++;
+                text.DeleteSub(start, end - start);
+                text.Insert(" ", start);
+                p = start + 1;
+              } else {
+                p++;
+              }
+            }
+
+            if (output.GetLength() > 0)
+              output.Append("\n");
+            output.AppendFormatted(512, "%s-%s %s", startBuf, endBuf, text.Get());
+        }
+      }
+      if (output.GetLength() > 0)
+        CF_SetClipboard(output.Get());
+    }
+    break;
+    case COPY_ROLE_DISTRIBUTION_MSG:
+      CopyRoleDistributionAction(NULL);
 			break;
 		case CMBID_TYPE:
 			if (HIWORD(wParam)==CBN_SELCHANGE) {
 				SetType(m_cbType.GetCurSel2());
 				if (!g_locked)
 					SetFocus(m_edit);
+			}
+			break;
+    case CMBID_REGION:
+      if (HIWORD(wParam) == CBN_SELCHANGE) {
+        int selIdx = m_cbRegion.GetCurSel2();
+        if (selIdx >= 0 && selIdx < m_overlappingRegionIds.GetSize()) {
+          g_lastMarkerRegionId = m_overlappingRegionIds.Get()[selIdx];
+          if (g_hideRegions) {
+            SNM_RegionSubtitle *sub = g_pRegionSubs.Get()->Get(g_lastMarkerRegionId);
+            if (sub)
+              SetText(sub->GetNotes());
+          } else {
+            for (int i = 0; i < g_pRegionSubs.Get()->GetSize(); i++) {
+              SNM_RegionSubtitle *sub = g_pRegionSubs.Get()->Get(i);
+              if (sub->GetId() == g_lastMarkerRegionId) {
+                SetText(sub->GetNotes());
+                break;
+              }
+            }
+          }
+          RefreshGUI();
+          if (!g_locked)
+            SetFocus(m_edit);
+        }
+      }
+      break;
+    case LINK_ACTOR_MSG:
+      if (m_contextMenuActor) {
+        char reply[256] = "";
+        if (DialogBoxParam(g_hInst,
+                           MAKEINTRESOURCE(IDD_LINK_ACTOR),
+                           m_hwnd,
+                           LinkActorDlgProc,
+                           (LPARAM)reply) && reply[0]) {
+          m_contextMenuActor->SetLinkedActorName(reply);
+          WDL_PtrList_DOD<SNM_Actor> *actors = g_actors.Get();
+          for (int i = 0; i < actors->GetSize(); i++) {
+            SNM_Actor *a = actors->Get(i);
+            if (a != m_contextMenuActor && a->HasLinkedActor()
+              && !strcmp(a->GetLinkedActorName(), reply) && a->HasCustomColor()) {
+              m_contextMenuActor->SetColor(a->GetColor());
+              m_contextMenuActor->SetHasCustomColor(true);
+              break;
+            }
+          }
+          UpdateRegionColors();
+          RefreshActorList();
+          MarkProjectDirty(NULL);
+        }
+      }
+      break;
+    case UNLINK_ACTOR_MSG:
+      if (m_contextMenuActor) {
+        m_contextMenuActor->SetLinkedActorName("");
+        m_contextMenuActor->SetHasCustomColor(false);
+        m_contextMenuActor->SetColor(GenerateActorColor(m_contextMenuActor->GetName()));
+        UpdateRegionColors();
+        RefreshActorList();
+        MarkProjectDirty(NULL);
+      }
+      break;
+    case CHANGE_COLOR_MSG:
+      if (m_contextMenuActor) {
+        int color = m_contextMenuActor->GetEffectiveColor() & 0xFFFFFF;
+        if (GR_SelectColor(m_hwnd, &color)) {
+          color |= 0x1000000;
+          if (m_contextMenuActor->HasLinkedActor()) {
+            const char *linked = m_contextMenuActor->GetLinkedActorName();
+            WDL_PtrList_DOD<SNM_Actor> *actors = g_actors.Get();
+            for (int i = 0; i < actors->GetSize(); i++) {
+              SNM_Actor *a = actors->Get(i);
+              if (a->HasLinkedActor() && !strcmp(a->GetLinkedActorName(), linked)) {
+                a->SetColor(color);
+                a->SetHasCustomColor(true);
+              }
+            }
+          } else {
+            m_contextMenuActor->SetColor(color);
+            m_contextMenuActor->SetHasCustomColor(true);
+          }
+          UpdateRegionColors();
+          RefreshActorList();
+          MarkProjectDirty(NULL);
+        }
+      }
+      break;
+    case EXPORT_ROLES_MSG: {
+      WDL_PtrList_DOD<SNM_Actor> *actors = g_actors.Get();
+      bool hasData = false;
+      for (int i = 0; i < actors->GetSize(); i++) {
+        SNM_Actor *a = actors->Get(i);
+        if (a->HasLinkedActor() || a->HasCustomColor()) {
+          hasData = true;
+          break;
+        }
+      }
+      if (!hasData) {
+        MessageBox(m_hwnd,
+                   __LOCALIZE("Ничего не найдено для экспорта.", "sws_DLG_152"),
+                   __LOCALIZE("ReNotes", "sws_DLG_152"),
+                   MB_OK);
+        break;
+      }
+      char fn[SNM_MAX_PATH] = "";
+      if (BrowseForSaveFile(
+        __LOCALIZE("ReNotes - Экспортировать ролёвку", "sws_DLG_152"),
+        g_lastRolesFn,
+        NULL,
+        SNM_ROLES_EXT_LIST,
+        fn,
+        sizeof(fn))) {
+        lstrcpyn(g_lastRolesFn, fn, sizeof(g_lastRolesFn));
+        if (!ExportRolesFile(fn))
+          MessageBox(m_hwnd,
+                     __LOCALIZE("Не удалось экспортировать ролёвку.", "sws_DLG_152"),
+                     __LOCALIZE("ReNotes - Ошибка", "sws_DLG_152"),
+                     MB_OK);
+      }
+    }
+    break;
+    case IMPORT_ROLES_MSG:
+      if (char *fn = BrowseForFiles(
+        __LOCALIZE("ReNotes - Импортировать ролёвку", "sws_DLG_152"),
+        g_lastRolesFn,
+        NULL,
+        false,
+        SNM_ROLES_EXT_LIST)) {
+        lstrcpyn(g_lastRolesFn, fn, sizeof(g_lastRolesFn));
+        if (ImportRolesFile(fn)) {
+          UpdateRegionColors();
+          RefreshActorList();
+          ForceUpdateRgnSub();
+          RefreshGUI();
+          MarkProjectDirty(NULL);
+        } else
+          MessageBox(m_hwnd,
+                     __LOCALIZE("Некорректный файл ролёвки!", "sws_DLG_152"),
+                     __LOCALIZE("ReNotes - Ошибка", "sws_DLG_152"),
+                     MB_OK);
+        free(fn);
 			}
 			break;
 		default:
@@ -436,15 +1039,118 @@ bool NotesWnd::IsActive(bool bWantEdit) {
 HMENU NotesWnd::OnContextMenu(int x, int y, bool* wantDefaultItems)
 {
   HMENU hMenu = CreatePopupMenu();
-  AddToMenu(hMenu, __LOCALIZE("Wrap text","sws_DLG_152"), WRAP_MSG, -1, false, g_wrapText ? MFS_CHECKED : MFS_UNCHECKED);
-  if (g_notesType == SNM_NOTES_GLOBAL) // save global notes from ctx menu (only if global notes visible)
-	AddToMenu(hMenu, __LOCALIZE("Save global notes", "sws_DLG_152"), SAVE_GLOBAL_NOTES_MSG, -1, false);
-#ifdef WANT_ACTION_HELP
-	if (g_notesType == SNM_NOTES_ACTION_HELP)
-	{
-		AddToMenu(hMenu, __LOCALIZE("Set action help file...","sws_DLG_152"), SET_ACTION_HELP_FILE_MSG);
+
+  if (g_notesType == SNM_NOTES_RGN_SUB && m_actorListView) {
+    HWND listHwnd = m_actorListView->GetHWND();
+    RECT listRect;
+    GetWindowRect(listHwnd, &listRect);
+    POINT pt = {x, y};
+    if (PtInRect(&listRect, pt) && g_actors.Get()->GetSize() > 0) {
+      int iCol;
+      SWS_ListItem *hitItem = m_actorListView->GetHitItem(x, y, &iCol);
+      if (hitItem) {
+        ActorListItem *actorItem = (ActorListItem *) hitItem;
+        m_contextMenuActor = actorItem->actor;
+        if (m_contextMenuActor) {
+          if (m_contextMenuActor->HasLinkedActor())
+            AddToMenu(hMenu, __LOCALIZE("Отвязать актёра","sws_DLG_152"),
+                      UNLINK_ACTOR_MSG,
+                      -1,
+                      false);
+          else
+            AddToMenu(hMenu,
+                      __LOCALIZE("Привязать актёра", "sws_DLG_152"),
+                      LINK_ACTOR_MSG,
+                      -1,
+                      false);
+          AddToMenu(hMenu,
+                    m_contextMenuActor->HasLinkedActor()
+                      ? __LOCALIZE("Изменить цвет (актёр)", "sws_DLG_152")
+                      : __LOCALIZE("Изменить цвет", "sws_DLG_152"),
+                    CHANGE_COLOR_MSG,
+                    -1,
+                    false);
+          AddToMenu(hMenu, SWS_SEPARATOR, 0);
 	}
-#endif
+      }
+      AddToMenu(hMenu,
+                __LOCALIZE("Все ✓\tCtrl+Shift+A", "sws_DLG_152"),
+                ENABLE_ALL_MSG,
+                -1,
+                false);
+      AddToMenu(hMenu,
+                __LOCALIZE("Все 🗙\tCtrl+Shift+D", "sws_DLG_152"),
+                DISABLE_ALL_MSG,
+                -1,
+                false);
+      AddToMenu(hMenu, SWS_SEPARATOR, 0);
+      AddToMenu(hMenu,
+                __LOCALIZE("Импортировать ролёвку\tCtrl+Shift+I", "sws_DLG_152"),
+                IMPORT_ROLES_MSG,
+                -1,
+                false);
+      AddToMenu(hMenu,
+                __LOCALIZE("Экспортировать ролёвку\tCtrl+Shift+E", "sws_DLG_152"),
+                EXPORT_ROLES_MSG,
+                -1,
+                false);
+      AddToMenu(hMenu, SWS_SEPARATOR, 0);
+      AddToMenu(hMenu,
+                __LOCALIZE("Скопировать ролёвку в буфер обмена\tCtrl+Shift+R", "sws_DLG_152"),
+                COPY_ROLE_DISTRIBUTION_MSG,
+                -1,
+                false);
+      *wantDefaultItems = false;
+      return hMenu;
+    }
+  }
+
+  if (g_notesType == SNM_NOTES_RGN_SUB) {
+    AddToMenu(hMenu,
+              __LOCALIZE("Скопировать текущую фразу в буфер обмена\tCtrl+C", "sws_DLG_152"),
+              COPY_CURRENT_PHRASE_MSG, -1, false,
+              m_overlappingRegionIds.GetSize() > 0 ? MF_ENABLED : MF_GRAYED);
+    AddToMenu(hMenu,
+              __LOCALIZE("Скопировать маркеры в буфер обмена\tCtrl+M", "sws_DLG_152"),
+              COPY_MARKERS_MSG,
+              -1,
+              false);
+
+    AddToMenu(hMenu, SWS_SEPARATOR, 0);
+    AddToMenu(hMenu,
+              __LOCALIZE("Отображать цветные регионы\tC", "sws_DLG_152"),
+              COLORED_REGIONS_MSG,
+              -1,
+              false);
+    if (g_coloredRegions)
+      CheckMenuItem(hMenu, COLORED_REGIONS_MSG, MF_BYCOMMAND | MF_CHECKED);
+    AddToMenu(hMenu,
+              __LOCALIZE("Отображать привязанного актёра в префиксе\tP", "sws_DLG_152"),
+              DISPLAY_ACTOR_PREFIX_MSG,
+              -1,
+              false);
+    if (g_displayActorInPrefix)
+      CheckMenuItem(hMenu, DISPLAY_ACTOR_PREFIX_MSG, MF_BYCOMMAND | MF_CHECKED);
+
+    AddToMenu(hMenu, SWS_SEPARATOR, 0);
+    AddToMenu(hMenu,
+              __LOCALIZE("Скрыть ролёвку\tA", "sws_DLG_152"),
+              HIDE_ACTOR_LIST_MSG,
+              -1,
+              false);
+    if (g_hideActorList)
+      CheckMenuItem(hMenu, HIDE_ACTOR_LIST_MSG, MF_BYCOMMAND | MF_CHECKED);
+    AddToMenu(hMenu,
+              __LOCALIZE("Скрыть регионы\tR", "sws_DLG_152"),
+              HIDE_REGIONS_MSG,
+              -1,
+              false);
+    if (g_hideRegions)
+      CheckMenuItem(hMenu, HIDE_REGIONS_MSG, MF_BYCOMMAND | MF_CHECKED);
+  }
+
+  if (g_notesType == SNM_NOTES_GLOBAL)
+    AddToMenu(hMenu, __LOCALIZE("Сохранить глобальные заметки", "sws_DLG_152"), SAVE_GLOBAL_NOTES_MSG, -1, false);
   return hMenu;
 }
 
@@ -463,23 +1169,120 @@ void OSXForceTxtChangeJob::Perform() {
 //  1 = eat
 int NotesWnd::OnKey(MSG* _msg, int _iKeyState)
 {
-	if (g_locked)
+	if (_msg->message == WM_KEYDOWN) {
+    bool editFocused = (_msg->hwnd == m_edit) && !g_locked;
+    bool isRgnSub    = (g_notesType == SNM_NOTES_RGN_SUB);
+
+    if (!editFocused && !_iKeyState && _msg->wParam == 'L') {
+      OnCommand(BTNID_LOCK, 0);
+      return 1;
+	}
+
+    if (isRgnSub) {
+      if (_iKeyState == (LVKF_CONTROL | LVKF_SHIFT)) {
+        switch (_msg->wParam) {
+          case VK_DELETE: OnCommand(BTNID_CLEAR_SUBS, 0);           return 1;
+          case 'I':       OnCommand(IMPORT_ROLES_MSG, 0);           return 1;
+          case 'E':       OnCommand(EXPORT_ROLES_MSG, 0);           return 1;
+          case 'R':       OnCommand(COPY_ROLE_DISTRIBUTION_MSG, 0); return 1;
+          case 'A':       OnCommand(ENABLE_ALL_MSG, 0);             return 1;
+          case 'D':       OnCommand(DISABLE_ALL_MSG, 0);            return 1;
+        }
+      }
+      if (_iKeyState == LVKF_CONTROL) {
+        switch (_msg->wParam) {
+          case 'I': OnCommand(BTNID_IMPORT_SUB, 0);  return 1;
+          case 'M': OnCommand(COPY_MARKERS_MSG, 0);  return 1;
+          case 'C':
+            if (!editFocused) { OnCommand(COPY_CURRENT_PHRASE_MSG, 0); return 1; }
+            break;
+          case 'V':
+#ifdef _WIN32
+            if (IsClipboardFormatAvailable(CF_HDROP)) {
+              if (OpenClipboard(m_hwnd)) {
+                HANDLE hDrop = GetClipboardData(CF_HDROP);
+                if (hDrop) {
+                  HDROP hdrop = (HDROP)GlobalLock(hDrop);
+                  if (hdrop) {
+                    int iFiles = DragQueryFile(hdrop, 0xFFFFFFFF, NULL, 0);
+                    bool imported = false;
+                    bool rolesImported = false;
+                    for (int i = 0; i < iFiles; i++) {
+                      char fn[SNM_MAX_PATH] = "";
+                      DragQueryFile(hdrop, i, fn, sizeof(fn));
+                      if (HasFileExtension(fn, "ASS")) {
+                        if (ImportAssFile(fn)) imported = true;
+                        lstrcpyn(g_lastImportSubFn, fn, sizeof(g_lastImportSubFn));
+                      } else if (HasFileExtension(fn, "SRT")) {
+                        if (ImportSubRipFile(fn)) imported = true;
+                        lstrcpyn(g_lastImportSubFn, fn, sizeof(g_lastImportSubFn));
+                      } else if (HasFileExtension(fn, "ROLES")) {
+                        if (ImportRolesFile(fn)) {
+                          lstrcpyn(g_lastRolesFn, fn, sizeof(g_lastRolesFn));
+                          rolesImported = true;
+                        } else {
+                          MessageBox(GetMainHwnd(),
+                                     __LOCALIZE("Некорректный файл ролёвки!", "sws_DLG_152"),
+                                     __LOCALIZE("ReNotes - Ошибка", "sws_DLG_152"),
+                                     MB_OK);
+                        }
+                      } else {
+                        MessageBox(GetMainHwnd(),
+                                   __LOCALIZE("Некорректный файл субтитров!", "sws_DLG_152"),
+                                   __LOCALIZE("ReNotes - Ошибка", "sws_DLG_152"),
+                                   MB_OK);
+                      }
+                    }
+                    GlobalUnlock(hDrop);
+                    if (imported) {
+                      MarkProjectDirty(NULL);
+                      RefreshActorList();
+                    }
+                    if (rolesImported) {
+                      UpdateRegionColors();
+                      RefreshActorList();
+                      ForceUpdateRgnSub();
+                      RefreshGUI();
+                      MarkProjectDirty(NULL);
+                    }
+                  }
+                }
+                CloseClipboard();
+              }
+              return 1;
+            }
+#endif
+            break;
+        }
+      }
+      if (!editFocused && !_iKeyState) {
+        switch (_msg->wParam) {
+          case 'C': OnCommand(COLORED_REGIONS_MSG,      0); return 1;
+          case 'P': OnCommand(DISPLAY_ACTOR_PREFIX_MSG, 0); return 1;
+          case 'R': OnCommand(HIDE_REGIONS_MSG,         0); return 1;
+          case 'A': OnCommand(HIDE_ACTOR_LIST_MSG,      0); return 1;
+        }
+      }
+    }
+  }
+
+  if (g_locked)
 	{
 		_msg->hwnd = m_hwnd; // redirect to main window
-		return 0;
+    return 0;
 	}
 	else if(_msg->hwnd == m_edit)
 	{
 #ifdef _SNM_SWELL_ISSUES
-		// fix/workaround (SWELL bug?): EN_CHANGE is not always sent...
+		// Fix/workaround (SWELL bug?): EN_CHANGE is not always sent.
 		ScheduledJob::Schedule(new OSXForceTxtChangeJob());
 #endif
 		return -1;
 	}
 	else if (_msg->message == WM_KEYDOWN || _msg->message == WM_CHAR)
 	{
-		// ctrl+A => select all
-		if (_msg->wParam == 'A' && _iKeyState == LVKF_CONTROL)
+		// Ctrl+A selects all text.
+    if (_msg->wParam == 'A' && _iKeyState == LVKF_CONTROL)
 		{
 			SetFocus(m_edit);
 			SendMessage(m_edit, EM_SETSEL, 0, -1);
@@ -494,17 +1297,17 @@ void NotesWnd::OnTimer(WPARAM wParam)
 	if (wParam == UPDATE_TIMER)
 	{
 		// register to marker and region updates only when needed (less stress for REAPER)
-		if (g_notesType>=SNM_NOTES_MKR_NAME && g_notesType<=SNM_NOTES_MKRRGN_SUB)
+		if (g_notesType == SNM_NOTES_RGN_SUB)
 			RegisterToMarkerRegionUpdates(&m_mkrRgnListener); // no-op if alreday registered
 		else
 			UnregisterToMarkerRegionUpdates(&m_mkrRgnListener);
 
 		// no update when editing text or when the view is hidden (e.g. inactive docker tab).
-		// when the view is active: update only for markers and if the view is locked 
+    // when the view is active: update only for regions and if the view is locked
 		// => updates during playback, in other cases (e.g. item selection change) the main 
 		// window will be the active one, not our NotesWnd
 		if (g_notesType!=SNM_NOTES_PROJECT && g_notesType!=SNM_NOTES_PROJECT_EXTRA && g_notesType!=SNM_NOTES_GLOBAL && 
-		    IsWindowVisible(m_hwnd) && (!IsActive() || (g_locked && (g_notesType>=SNM_NOTES_MKR_NAME && g_notesType<=SNM_NOTES_MKRRGN_SUB))))
+		    IsWindowVisible(m_hwnd) && (!IsActive() || (g_locked && g_notesType == SNM_NOTES_RGN_SUB)))
 		{
 			Update();
 		}
@@ -516,11 +1319,7 @@ void NotesWnd::OnResize()
 	if (g_notesType != g_prevNotesType)
 	{
 		// room for buttons?
-		if (
-#ifdef WANT_ACTION_HELP
-        g_notesType==SNM_NOTES_ACTION_HELP || 
-#endif
-        (g_notesType>=SNM_NOTES_MKR_SUB && g_notesType<=SNM_NOTES_MKRRGN_SUB)) {
+		if (g_notesType== SNM_NOTES_RGN_SUB) {
 			m_resize.get_item(IDC_EDIT1)->orig.bottom = m_resize.get_item(IDC_EDIT1)->real_orig.bottom - 41; //JFB!! 41 is tied to the current .rc!
 			m_resize.get_item(IDC_EDIT2)->orig.bottom = m_resize.get_item(IDC_EDIT2)->real_orig.bottom - 41; //JFB!! 41 is tied to the current .rc!
 		}
@@ -530,6 +1329,45 @@ void NotesWnd::OnResize()
 		}
 		InvalidateRect(m_hwnd, NULL, 0);
 	}
+
+  if (g_notesType == SNM_NOTES_RGN_SUB) {
+    RECT r;
+    GetClientRect(m_hwnd, &r);
+    HWND listHwnd = m_actorListView->GetHWND();
+    if (!g_hideActorList) {
+      int panelWidth = max(150, (int) r.right / 6);
+      m_resize.get_item(IDC_EDIT1)->orig.right = m_resize.get_item(IDC_EDIT1)->real_orig.right -
+          panelWidth;
+      m_resize.get_item(IDC_EDIT1)->orig.bottom = m_resize.get_item(IDC_EDIT1)->real_orig.bottom - 41;
+      m_resize.get_item(IDC_EDIT2)->orig.right = m_resize.get_item(IDC_EDIT2)->real_orig.right -
+          panelWidth;
+      m_resize.get_item(IDC_EDIT2)->orig.bottom = m_resize.get_item(IDC_EDIT2)->real_orig.bottom - 41;
+      int listBottom = r.bottom - 16;
+      int rightMargin = SNM_GUI_X_MARGIN;
+      ShowWindow(listHwnd, SW_SHOWNA);
+      SetWindowPos(listHwnd,
+                   NULL,
+                   r.right - panelWidth - rightMargin,
+                   SNM_GUI_TOP_H,
+                   panelWidth,
+                   listBottom - SNM_GUI_TOP_H,
+                   SWP_NOZORDER);
+      int vscrollWidth = GetSystemMetrics(SM_CXVSCROLL);
+      ListView_SetColumnWidth(listHwnd, 0, 26);
+      ListView_SetColumnWidth(listHwnd, 1, panelWidth - 26 - vscrollWidth);
+    } else {
+      ShowWindow(listHwnd, SW_HIDE);
+      m_resize.get_item(IDC_EDIT1)->orig.right = m_resize.get_item(IDC_EDIT1)->real_orig.right;
+      m_resize.get_item(IDC_EDIT1)->orig.bottom = m_resize.get_item(IDC_EDIT1)->real_orig.bottom - 41;
+      m_resize.get_item(IDC_EDIT2)->orig.right = m_resize.get_item(IDC_EDIT2)->real_orig.right;
+      m_resize.get_item(IDC_EDIT2)->orig.bottom = m_resize.get_item(IDC_EDIT2)->real_orig.bottom - 41;
+    }
+    m_actorListView->Update();
+  } else {
+    ShowWindow(m_actorListView->GetHWND(), SW_HIDE);
+    m_resize.get_item(IDC_EDIT1)->orig.right = m_resize.get_item(IDC_EDIT1)->real_orig.right;
+    m_resize.get_item(IDC_EDIT2)->orig.right = m_resize.get_item(IDC_EDIT2)->real_orig.right;
+  }
 }
 
 void NotesWnd::DrawControls(LICE_IBitmap* _bm, const RECT* _r, int* _tooltipHeight)
@@ -544,15 +1382,36 @@ void NotesWnd::DrawControls(LICE_IBitmap* _bm, const RECT* _r, int* _tooltipHeig
 	{
 		// work on a copy rather than g_lastText (will get modified)
 		char buf[sizeof(g_lastText)]{};
-		GetWindowText(m_edit, buf, sizeof(buf));
+    lstrcpyn(buf, g_lastText, sizeof(buf));
 		if (*buf)
 		{
-			if (g_notesType>=SNM_NOTES_MKR_NAME && g_notesType<=SNM_NOTES_MKRRGN_NAME)
-				ShortenStringToFirstRN(buf, true);
-
 			RECT r = *_r;
 			r.top += h;
+      if (g_notesType == SNM_NOTES_RGN_SUB && !g_hideActorList)
+        r.right -= max(150, (int) (_r->right - _r->left) / 6);
 			m_bigNotes.SetPosition(&r);
+
+      m_bigNotes.ClearActorColors();
+      if (g_notesType == SNM_NOTES_RGN_SUB) {
+        int defaultRegionColor = 0;
+        if (ColorTheme *ct = SNM_GetColorTheme())
+          defaultRegionColor = ct->region;
+        for (int i = 0; i < g_actors.Get()->GetSize(); i++) {
+          SNM_Actor *actor = g_actors.Get()->Get(i);
+          if (actor) {
+            int color = actor->GetEffectiveColor();
+            m_bigNotes.AddActorColor(actor->GetName(), color ? color : defaultRegionColor);
+          }
+        }
+      }
+
+      for (char *p = buf; p[0] && p[1]; p++) {
+        if (p[0] == '\\' && (p[1] == 'N' || p[1] == 'n')) {
+          p[0] = '\n';
+          memmove(p + 1, p + 2, strlen(p + 2) + 1);
+        }
+      }
+
 			m_bigNotes.SetText(buf);
 			m_bigNotes.SetVisible(true);
 		}
@@ -567,116 +1426,88 @@ void NotesWnd::DrawControls(LICE_IBitmap* _bm, const RECT* _r, int* _tooltipHeig
 	IconTheme* it = SNM_GetIconTheme();
 	int x0=_r->left+SNM_GUI_X_MARGIN;
 
-	SNM_SkinButton(&m_btnLock, it ? &it->toolbar_lock[!g_locked] : NULL, g_locked ? __LOCALIZE("Unlock","sws_DLG_152") : __LOCALIZE("Lock","sws_DLG_152"));
+	SNM_SkinButton(&m_btnLock, it ? &it->toolbar_lock[!g_locked] : NULL, g_locked ? __LOCALIZE("Разблокировать текст","sws_DLG_152") : __LOCALIZE("Заблокировать текст","sws_DLG_152"));
 	if (SNM_AutoVWndPosition(DT_LEFT, &m_btnLock, NULL, _r, &x0, _r->top, h))
 	{
 		if (SNM_AutoVWndPosition(DT_LEFT, &m_cbType, NULL, _r, &x0, _r->top, h))
 		{
-			char str[512];
-			lstrcpyn(str, __LOCALIZE("No selection!","sws_DLG_152"), sizeof(str));
-			switch(g_notesType)
-			{
-				case SNM_NOTES_PROJECT:
-				case SNM_NOTES_PROJECT_EXTRA:
-				{
-					char buf[SNM_MAX_PATH];
-					EnumProjects(-1, buf, sizeof(buf));
-					lstrcpyn(str, GetFilenameWithExt(buf), sizeof(str));
-					break;
-				}
-				case SNM_NOTES_ITEM:
-					if (g_mediaItemNote)
-					{
-						MediaItem_Take* tk = GetActiveTake(g_mediaItemNote);
-						char* tkName= tk ? (char*)GetSetMediaItemTakeInfo(tk, "P_NAME", NULL) : NULL;
-						lstrcpyn(str, tkName?tkName:"", sizeof(str));
-					}
-					break;
-				case SNM_NOTES_TRACK:
-					if (g_trNote)
-					{
-						int id = CSurf_TrackToID(g_trNote, false);
-						if (id > 0) {
-							char* trName = (char*)GetSetMediaTrackInfo(g_trNote, "P_NAME", NULL);
-							snprintf(str, sizeof(str), "[%d] \"%s\"", id, trName?trName:"");
+      if (!g_locked && g_notesType == SNM_NOTES_RGN_SUB
+        && m_overlappingRegionIds.GetSize() > 1) {
+        SNM_AutoVWndPosition(DT_LEFT, &m_cbRegion, NULL, _r, &x0, _r->top, h);
+        m_cbRegion.SetVisible(true);
 						}
-						else if (id == 0)
-							strcpy(str, __LOCALIZE("[MASTER]","sws_DLG_152"));
-					}
-					break;
-				case SNM_NOTES_GLOBAL:
-					if (g_globalNotesDirty)
-						lstrcpyn(str, "[modified]", sizeof(str));
-					else
-						lstrcpyn(str, "", sizeof(str));
-					break;
+						else {
+        m_cbRegion.SetVisible(false);
+      }
 
-				case SNM_NOTES_MKR_NAME:
-				case SNM_NOTES_MKR_SUB:
-					if (g_lastMarkerRegionId <= 0 || EnumMarkerRegionDescById(NULL, g_lastMarkerRegionId, str, sizeof(str), SNM_MARKER_MASK, true, g_notesType==SNM_NOTES_MKR_SUB, true)<0 || !*str)
-						lstrcpyn(str, __LOCALIZE("No marker at play/edit cursor!","sws_DLG_152"), sizeof(str));
-					break;
-				case SNM_NOTES_RGN_NAME:
-				case SNM_NOTES_RGN_SUB:
-					if (g_lastMarkerRegionId <= 0 || EnumMarkerRegionDescById(NULL, g_lastMarkerRegionId, str, sizeof(str), SNM_REGION_MASK, true, g_notesType==SNM_NOTES_RGN_SUB, true)<0 || !*str)
-						lstrcpyn(str, __LOCALIZE("No region at play/edit cursor!","sws_DLG_152"), sizeof(str));
-					break;
-				case SNM_NOTES_MKRRGN_NAME:
-				case SNM_NOTES_MKRRGN_SUB:
-					if (g_lastMarkerRegionId <= 0 || EnumMarkerRegionDescById(NULL, g_lastMarkerRegionId, str, sizeof(str), SNM_MARKER_MASK|SNM_REGION_MASK, true, g_notesType==SNM_NOTES_MKRRGN_SUB, true)<0 || !*str)
-						lstrcpyn(str, __LOCALIZE("No marker or region at play/edit cursor!","sws_DLG_152"), sizeof(str));
-					break;
-#ifdef WANT_ACTION_HELP
-				case SNM_NOTES_ACTION_HELP:
-					if (*g_lastActionDesc && *g_lastActionSection)
-						snprintf(str, sizeof(str), " [%s] %s", g_lastActionSection, g_lastActionDesc);
-/*JFB!!! API LIMITATION: use smthg like that when we will be able to access all sections
-						lstrcpyn(str, kbd_getTextFromCmd(g_lastActionListCmd, NULL), 512);
-*/
-					break;
-#endif
+      if (g_notesType == SNM_NOTES_RGN_SUB) {
+        SNM_SkinToolbarButton(&m_btnImportSub, __LOCALIZE("Добавить субтитры","sws_DLG_152"));
+			if (SNM_AutoVWndPosition(DT_LEFT, &m_btnImportSub, NULL, _r, &x0, _r->top, h)) {
+          SNM_SkinToolbarButton(&m_btnClearSubs, __LOCALIZE("Очистить", "sws_DLG_152"));
+          SNM_AutoVWndPosition(DT_LEFT, &m_btnClearSubs, NULL, _r, &x0, _r->top, h);
+        }
 			}
 
-			m_txtLabel.SetText(str);
-			if (SNM_AutoVWndPosition(DT_LEFT, &m_txtLabel, NULL, _r, &x0, _r->top, h))
 				SNM_AddLogo(_bm, _r, x0, h);
 		}
 	}
 
+  m_txtLabel.SetVisible(false);
 
 	// 2nd row of controls
-	if (g_locked)
-		return;
-
-	x0 = _r->left+SNM_GUI_X_MARGIN; h=SNM_GUI_BOT_H;
+  x0 = _r->left+SNM_GUI_X_MARGIN; h=SNM_GUI_BOT_H;
 	int y0 = _r->bottom-h;
 
-	// import/export buttons
-	if (g_notesType>=SNM_NOTES_MKR_SUB && g_notesType<=SNM_NOTES_MKRRGN_SUB)
+  if (g_notesType == SNM_NOTES_RGN_SUB && !g_hideActorList)
 	{
-		SNM_SkinToolbarButton(&m_btnImportSub, __LOCALIZE("Import...","sws_DLG_152"));
-		if (!SNM_AutoVWndPosition(DT_LEFT, &m_btnImportSub, NULL, _r, &x0, y0, h, 4))
-			return;
+    int panelWidth = max(150, (int) (_r->right - _r->left) / 6);
+    int tableLeft = _r->right - panelWidth - SNM_GUI_X_MARGIN;
 
-		SNM_SkinToolbarButton(&m_btnExportSub, __LOCALIZE("Export...","sws_DLG_152"));
-		if (!SNM_AutoVWndPosition(DT_LEFT, &m_btnExportSub, NULL, _r, &x0, y0, h))
+    int listTop = SNM_GUI_TOP_H;
+    int listBottom = _r->bottom - 16;
+    int listRight = tableLeft + panelWidth;
+    int pencol = LICE_RGBA_FROMNATIVE(WDL_STYLE_GetSysColor(COLOR_3DSHADOW), 255);
+    LICE_Line(_bm,
+              tableLeft - 1,
+              listTop - 1,
+              listRight,
+              listTop - 1,
+              pencol,
+              1.0f,
+              LICE_BLIT_MODE_COPY,
+              false);
+    LICE_Line(_bm,
+              tableLeft - 1,
+              listBottom,
+              listRight,
+              listBottom,
+              pencol,
+              1.0f,
+              LICE_BLIT_MODE_COPY,
+              false);
+    LICE_Line(_bm,
+              tableLeft - 1,
+              listTop - 1,
+              tableLeft - 1,
+              listBottom,
+              pencol,
+              1.0f,
+              LICE_BLIT_MODE_COPY,
+              false);
+    LICE_Line(_bm,
+              listRight,
+              listTop - 1,
+              listRight,
+              listBottom,
+              pencol,
+              1.0f,
+              LICE_BLIT_MODE_COPY,
+              false);
+  }
+
+  if (g_locked)
 			return;
 	}
-
-#ifdef WANT_ACTION_HELP
-	// online help & action list buttons
-	if (g_notesType == SNM_NOTES_ACTION_HELP)
-	{
-		SNM_SkinToolbarButton(&m_btnActionList, __LOCALIZE("Action list...","sws_DLG_152"));
-		if (!SNM_AutoVWndPosition(DT_LEFT, &m_btnActionList, NULL, _r, &x0, y0, h, 4))
-			return;
-
-		SNM_SkinToolbarButton(&m_btnAlr, __LOCALIZE("Online help...","sws_DLG_152"));
-		if (!SNM_AutoVWndPosition(DT_LEFT, &m_btnAlr, NULL, _r, &x0, y0, h))
-			return;
-	}
-#endif
-}
 
 bool NotesWnd::GetToolTipString(int _xpos, int _ypos, char* _bufOut, int _bufOutSz)
 {
@@ -685,13 +1516,22 @@ bool NotesWnd::GetToolTipString(int _xpos, int _ypos, char* _bufOut, int _bufOut
 		switch (v->GetID())
 		{
 			case BTNID_LOCK:
-				lstrcpyn(_bufOut, g_locked ? __LOCALIZE("Text locked ('Big font' mode)", "sws_DLG_152") : __LOCALIZE("Text unlocked", "sws_DLG_152"), _bufOutSz);
+        snprintf(_bufOut, _bufOutSz, "%s  (L)", g_locked ? __LOCALIZE("Текст заблокирован", "sws_DLG_152") : __LOCALIZE("Текст разблокирован", "sws_DLG_152"));
+        return true;
+      case BTNID_IMPORT_SUB:
+        snprintf(_bufOut, _bufOutSz, "%s  (Ctrl+I)",
+          __LOCALIZE("Добавить субтитры", "sws_DLG_152"));
+        return true;
+      case BTNID_CLEAR_SUBS:
+        snprintf(_bufOut, _bufOutSz, "%s  (Ctrl+Shift+Del)",
+          __LOCALIZE("Очистить", "sws_DLG_152"));
 				return true;
 			case CMBID_TYPE:
-				lstrcpyn(_bufOut, __LOCALIZE("Notes type","sws_DLG_152"), _bufOutSz);
+				lstrcpyn(_bufOut, __LOCALIZE("Режим","sws_DLG_152"), _bufOutSz);
 				return true;
-			case TXTID_LABEL:
-				lstrcpyn(_bufOut, ((WDL_VirtualStaticText*)v)->GetText(), _bufOutSz);
+			case CMBID_REGION:
+				lstrcpyn(_bufOut,
+                 __LOCALIZE("Выберите регион для редактирования", "sws_DLG_152"), _bufOutSz);
 				return true;
 		}
 	}
@@ -702,13 +1542,19 @@ void NotesWnd::ToggleLock()
 {
 	g_locked = !g_locked;
 	RefreshToolbar(SWSGetCommandID(ToggleNotesLock));
-	if (g_notesType>=SNM_NOTES_MKR_NAME && g_notesType<=SNM_NOTES_MKRRGN_SUB)
+	if (g_notesType == SNM_NOTES_RGN_SUB)
 		Update(true); // play vs edit cursor when unlocking
 	else
 		RefreshGUI();
 
 	if (!g_locked)
 		SetFocus(m_edit);
+}
+
+void NotesWnd::RefreshActorList() {
+  CleanupStaleActors();
+  if (m_actorListView)
+    m_actorListView->Update();
 }
 
 
@@ -733,19 +1579,9 @@ void NotesWnd::SaveCurrentText(int _type, bool _wantUndo)
 		case SNM_NOTES_GLOBAL:
 			SaveCurrentGlobalNotes(_wantUndo);
 			break;
-		case SNM_NOTES_MKR_NAME:
-		case SNM_NOTES_RGN_NAME:
-		case SNM_NOTES_MKRRGN_NAME:
-		case SNM_NOTES_MKR_SUB:
 		case SNM_NOTES_RGN_SUB:
-		case SNM_NOTES_MKRRGN_SUB:
-			SaveCurrentMkrRgnNameOrSub(_type, _wantUndo);
+      SaveCurrentRgnSub(_wantUndo);
 			break;
-#ifdef WANT_ACTION_HELP
-		case SNM_NOTES_ACTION_HELP:
-			SaveCurrentHelp();
-			break;
-#endif
 	}
 }
 
@@ -755,7 +1591,7 @@ void NotesWnd::SaveCurrentProjectNotes(bool _wantUndo)
 	GetSetProjectNotes(NULL, true, g_lastText, sizeof(g_lastText));
 /* project notes are out of the undo system's scope, MarkProjectDirty is the best thing we can do...
 	if (_wantUndo)
-		Undo_OnStateChangeEx2(NULL, __LOCALIZE("Edit project notes","sws_undo"), UNDO_STATE_ALL, -1);
+          Undo_OnStateChangeEx2(NULL, __LOCALIZE("Редактирование заметок проекта","sws_undo"), UNDO_STATE_ALL, -1);
 	else
 */
 	if (MarkProjectDirty)
@@ -766,9 +1602,6 @@ void NotesWnd::SaveCurrentExtraProjectNotes(bool _wantUndo)
 {
 	GetWindowText(m_edit, g_lastText, sizeof(g_lastText));
 	g_prjNotes.Get()->Set(g_lastText); // CRLF removed only when saving the project..
-	if (_wantUndo)
-		Undo_OnStateChangeEx2(NULL, __LOCALIZE("Edit exta project notes","sws_undo"), UNDO_STATE_MISCCFG, -1);
-	else
 		MarkProjectDirty(NULL);
 }
 
@@ -781,9 +1614,6 @@ void NotesWnd::SaveCurrentItemNotes(bool _wantUndo)
 		{
 //				UpdateItemInProject(g_mediaItemNote);
 			UpdateTimeline(); // for the item's note button 
-			if (_wantUndo)
-				Undo_OnStateChangeEx2(NULL, __LOCALIZE("Edit item notes","sws_undo"), UNDO_STATE_ALL, -1); //JFB TODO? -1 to replace? UNDO_STATE_ITEMS?
-			else
 				MarkProjectDirty(NULL);
 		}
 	}
@@ -799,9 +1629,6 @@ void NotesWnd::SaveCurrentTrackNotes(bool _wantUndo)
 		else
 			g_SNM_TrackNotes.Get()->Add(new SNM_TrackNotes(nullptr, TrackToGuid(g_trNote), g_lastText));
 
-		if (_wantUndo)
-			Undo_OnStateChangeEx2(NULL, __LOCALIZE("Edit track notes","sws_undo"), UNDO_STATE_MISCCFG, -1); //JFB TODO? -1 to replace?
-		else
 			MarkProjectDirty(NULL);
 	}
 }
@@ -812,7 +1639,7 @@ void NotesWnd::SaveCurrentGlobalNotes(bool _wantUndo)
 	g_globalNotes.Set(g_lastText);
 	/* dirty / modified status is displayed directly in notes window
 	if (_wantUndo)
-		Undo_OnStateChangeEx2(NULL, __LOCALIZE("Edit global notes", "sws_undo"), UNDO_STATE_MISCCFG, -1);
+      Undo_OnStateChangeEx2(NULL, __LOCALIZE("Редактирование глобальных заметок", "sws_undo"), UNDO_STATE_MISCCFG, -1);
 	else
 		MarkProjectDirty(NULL);
 	*/
@@ -821,66 +1648,62 @@ void NotesWnd::SaveCurrentGlobalNotes(bool _wantUndo)
 	RefreshGUI(); // to display [modified] in notes window immediately
 }
 
-void NotesWnd::SaveCurrentMkrRgnNameOrSub(int _type, bool _wantUndo)
+void NotesWnd::SaveCurrentRgnSub(bool _wantUndo)
 {
-	if (g_lastMarkerRegionId > 0)
+  if (g_hideRegions) {
+    if (g_lastMarkerRegionId >= 0) {
+		GetWindowText(m_edit, g_lastText, sizeof(g_lastText));
+      SNM_RegionSubtitle *sub = g_pRegionSubs.Get()->Get(g_lastMarkerRegionId);
+      if (sub)
+        sub->SetNotes(g_lastText);
+						MarkProjectDirty(NULL);
+				}
+    return;
+			}
+
+  if (g_lastMarkerRegionId > 0)
 	{
 		GetWindowText(m_edit, g_lastText, sizeof(g_lastText));
 
-		// set marker/region name?
-		if (_type>=SNM_NOTES_MKR_NAME && _type<=SNM_NOTES_MKRRGN_NAME)
-		{
-			double pos, end; int num, color; bool isRgn;
-			if (EnumMarkerRegionById(NULL, g_lastMarkerRegionId, &isRgn, &pos, &end, NULL, &num, &color)>=0)
-			{
-				ShortenStringToFirstRN(g_lastText);
-
-				// track marker/region name update => reentrant notif
-				// via SNM_MarkerRegionListener.NotifyMarkerRegionUpdate()
-				g_internalMkrRgnChange = true;
-
-				if (SetProjectMarker4(NULL, num, isRgn, pos, end, g_lastText, color, !*g_lastText ? 1 : 0))
-				{
-					UpdateTimeline();
-					if (_wantUndo)
-						Undo_OnStateChangeEx2(NULL, isRgn ? __LOCALIZE("Edit region name","sws_undo") : __LOCALIZE("Edit marker name","sws_undo"), UNDO_STATE_ALL, -1);
-					else
-						MarkProjectDirty(NULL);
-				}
-			}
-		}
-		// subtitles
-		else
-		{
-			// CRLF removed only when saving the project..
-			bool found = false;
+    SNM_RegionSubtitle *curSub = NULL;
 			for (int i=0; i < g_pRegionSubs.Get()->GetSize(); i++) 
 			{
 				if (g_pRegionSubs.Get()->Get(i)->GetId() == g_lastMarkerRegionId) {
-					g_pRegionSubs.Get()->Get(i)->SetNotes(g_lastText);
-					found = true;
+        curSub = g_pRegionSubs.Get()->Get(i);
+        curSub->SetNotes(g_lastText);
 					break;
 				}
 			}
-			if (!found)
-				g_pRegionSubs.Get()->Add(new SNM_RegionSubtitle(nullptr, g_lastMarkerRegionId, g_lastText));
-			if (_wantUndo)
-				Undo_OnStateChangeEx2(NULL, IsRegion(g_lastMarkerRegionId) ? __LOCALIZE("Edit region subtitle","sws_undo") : __LOCALIZE("Edit marker subtitle","sws_undo"), UNDO_STATE_MISCCFG, -1);
-			else
+			if (!curSub) {
+      curSub = new SNM_RegionSubtitle(nullptr, g_lastMarkerRegionId, g_lastText);
+      g_pRegionSubs.Get()->Add(curSub);
+    }
+
+    double pos, end;
+    int num, color;
+    bool isRgn;
+			if (EnumMarkerRegionById(NULL, g_lastMarkerRegionId, &isRgn, &pos, &end, NULL, &num, &color) >=
+      0) {
+      WDL_String regionName;
+      BuildRegionName(&regionName, curSub->GetActor(), g_lastText);
+
+			// Track the region-name update to avoid a reentrant notification
+			// via NotesMarkerRegionListener::NotifyMarkerRegionUpdate().
+      g_internalMkrRgnChange = true;
+      SetProjectMarker4(NULL,
+                        num,
+                        isRgn,
+                        pos,
+                        end,
+                        regionName.Get(),
+                        color,
+                        !*regionName.Get() ? 1 : 0);
+      UpdateTimeline();
+    }
+
 				MarkProjectDirty(NULL);
 		}
 	}
-}
-
-#ifdef WANT_ACTION_HELP
-void NotesWnd::SaveCurrentHelp()
-{
-	if (*g_lastActionCustId) {
-		GetWindowText(m_edit, g_lastText, sizeof(g_lastText));
-		SaveHelp(g_lastActionCustId, g_lastText);
-	}
-}
-#endif
 
 ///////////////////////////////////////////////////////////////////////////////
 
@@ -896,13 +1719,6 @@ void NotesWnd::Update(bool _force)
 	if (_force || g_notesType != g_prevNotesType)
 	{
 		g_prevNotesType = g_notesType;
-#ifdef WANT_ACTION_HELP
-		g_lastActionListSel = -1;
-		*g_lastActionCustId = '\0';
-		*g_lastActionDesc = '\0';
-		g_lastActionListCmd = 0;
-		*g_lastActionSection = '\0';
-#endif
 		g_mediaItemNote = NULL;
 		g_trNote = NULL;
 		g_lastMarkerPos = -1.0;
@@ -936,63 +1752,27 @@ void NotesWnd::Update(bool _force)
 			SetText(g_globalNotes.Get());
 			refreshType = REQUEST_REFRESH;
 			break;
-		case SNM_NOTES_MKR_NAME:
-		case SNM_NOTES_RGN_NAME:
-		case SNM_NOTES_MKRRGN_NAME:
-		case SNM_NOTES_MKR_SUB:
 		case SNM_NOTES_RGN_SUB:
-		case SNM_NOTES_MKRRGN_SUB:
-			refreshType = UpdateMkrRgnNameOrSub(g_notesType);
+			refreshType = UpdateRgnSub();
 			break;
-#ifdef WANT_ACTION_HELP
-		case SNM_NOTES_ACTION_HELP:
-			refreshType = UpdateActionHelp();
-			break;
-#endif
 	}
 	
 	if (_force || refreshType == REQUEST_REFRESH)
 		RefreshGUI();
 
+  if (g_notesType == SNM_NOTES_RGN_SUB) {
+    static WDL_PtrList_DOD<SNM_Actor> *s_lastActorPtr = nullptr;
+    static int s_lastActorCount = -1;
+    WDL_PtrList_DOD<SNM_Actor> *actors = g_actors.Get();
+    if (_force || actors != s_lastActorPtr || actors->GetSize() != s_lastActorCount) {
+      s_lastActorPtr = actors;
+      s_lastActorCount = actors->GetSize();
+      RefreshActorList();
+    }
+  }
+
 	sRecurseCheck = false;
 }
-
-#ifdef WANT_ACTION_HELP
-int NotesWnd::UpdateActionHelp()
-{
-	int refreshType = NO_REFRESH;
-	int iSel = GetSelectedAction(
-		g_lastActionSection, SNM_MAX_SECTION_NAME_LEN, &g_lastActionListCmd, 
-		g_lastActionCustId, SNM_MAX_ACTION_CUSTID_LEN, 
-		g_lastActionDesc, SNM_MAX_ACTION_NAME_LEN);
-
-	if (iSel >= 0)
-	{
-		if (iSel != g_lastActionListSel)
-		{
-			g_lastActionListSel = iSel;
-			if (*g_lastActionCustId && *g_lastActionDesc)
-			{
-				char buf[MAX_HELP_LENGTH] = "";
-				LoadHelp(g_lastActionCustId, buf, MAX_HELP_LENGTH);
-				SetText(buf);
-				refreshType = REQUEST_REFRESH;
-			}
-		}
-	}
-	else if (g_lastActionListSel>=0 || *g_lastText) // *g_lastText: when switching note types w/o nothing selected for the new type
-	{
-		g_lastActionListSel = -1;
-		*g_lastActionCustId = '\0';
-		*g_lastActionDesc = '\0';
-		g_lastActionListCmd = 0;
-		*g_lastActionSection = '\0';
-		SetText("");
-		refreshType = REQUEST_REFRESH;
-	}
-	return refreshType;
-}
-#endif
 
 int NotesWnd::UpdateItemNotes()
 {
@@ -1045,12 +1825,12 @@ int NotesWnd::UpdateTrackNotes()
 	return refreshType;
 }
 
-int NotesWnd::UpdateMkrRgnNameOrSub(int _type)
+int NotesWnd::UpdateRgnSub()
 {
 	int refreshType = NO_REFRESH;
 
 	double dPos=GetCursorPositionEx(NULL), accuracy=SNM_FUDGE_FACTOR;
-	if (g_locked && GetPlayStateEx(NULL)) { // playing & update required?
+	if (g_locked && GetPlayStateEx(NULL)) { // playing and update required
 		dPos = GetPlayPositionEx(NULL);
 		accuracy = 0.1; // do not stress REAPER
 	}
@@ -1058,154 +1838,368 @@ int NotesWnd::UpdateMkrRgnNameOrSub(int _type)
 	if (fabs(g_lastMarkerPos-dPos) > accuracy)
 	{
 		g_lastMarkerPos = dPos;
-		int mask = 0;
-		if (_type!=SNM_NOTES_MKR_NAME && _type!=SNM_NOTES_MKR_SUB)
-			mask |= SNM_REGION_MASK;
-		if (_type!=SNM_NOTES_RGN_NAME && _type!=SNM_NOTES_RGN_SUB)
-			mask |= SNM_MARKER_MASK;
 
-		// NF: could use API GetLastMarkerAndCurRegion() instead
-		int id, idx = FindMarkerRegion(NULL, dPos, mask, &id);
-		if (id > 0)
-		{
-			if (id != g_lastMarkerRegionId)
-			{
-				g_lastMarkerRegionId = id;
+    if (g_hideRegions) {
+      WDL_PtrList_DOD<SNM_RegionSubtitle> *subs = g_pRegionSubs.Get();
+      WDL_PtrList_DOD<SNM_Actor> *actors = g_actors.Get();
 
-				// update name?
-				if (_type>=SNM_NOTES_MKR_NAME && _type<=SNM_NOTES_MKRRGN_NAME)
-				{
-					const char* name = NULL;
-					EnumProjectMarkers2(NULL, idx, NULL, NULL, NULL, &name, NULL);
-					SetText(name ? name : "");
+      WDL_TypedBuf<int> newOverlapping;
+      for (int i = 0; i < subs->GetSize(); i++) {
+        SNM_RegionSubtitle *sub = subs->Get(i);
+		if (dPos < sub->GetStartTime() || dPos > sub->GetEndTime())
+          continue;
+        bool enabled = false;
+        for (int j = 0; j < actors->GetSize(); j++) {
+          if (!strcmp(actors->Get(j)->GetName(), sub->GetActor())) {
+            enabled = actors->Get(j)->IsEnabled();
+            break;
 				}
-				else // update subtitle
-				{
-					for (int i=0; i < g_pRegionSubs.Get()->GetSize(); i++)
-						if (g_pRegionSubs.Get()->Get(i)->GetId() == id) {
-							SetText(g_pRegionSubs.Get()->Get(i)->GetNotes());
-							return REQUEST_REFRESH;
 						}
-					g_pRegionSubs.Get()->Add(new SNM_RegionSubtitle(nullptr, id, ""));
-					SetText("");
+        if (enabled)
+          newOverlapping.Add(i);
+      }
+
+      if (newOverlapping.GetSize() > 0) {
+        bool regionsChanged = false;
+        if (newOverlapping.GetSize() != m_overlappingRegionIds.GetSize())
+          regionsChanged = true;
+        else {
+          for (int i = 0; i < newOverlapping.GetSize(); i++) {
+            if (newOverlapping.Get()[i] != m_overlappingRegionIds.Get()[i]) {
+              regionsChanged = true;
+              break;
+            }
+          }
+        }
+
+        if (regionsChanged) {
+          m_overlappingRegionIds.Resize(newOverlapping.GetSize());
+          memcpy(m_overlappingRegionIds.Get(),
+                 newOverlapping.Get(),
+                 newOverlapping.GetSize() * sizeof(int));
+
+          m_cbRegion.Empty();
+          for (int i = 0; i < m_overlappingRegionIds.GetSize(); i++) {
+            int subIdx = m_overlappingRegionIds.Get()[i];
+            SNM_RegionSubtitle *sub = subs->Get(subIdx);
+            char itemText[256];
+            const char *actor = sub->GetActor();
+            if (actor && *actor)
+              snprintf(itemText, sizeof(itemText), "%s", actor);
+            else
+              snprintf(itemText, sizeof(itemText), "Sub %d", i + 1);
+            m_cbRegion.AddItem(itemText);
+          }
+
+          int selIdx = 0;
+          for (int i = 0; i < m_overlappingRegionIds.GetSize(); i++) {
+            if (m_overlappingRegionIds.Get()[i] == g_lastMarkerRegionId) {
+              selIdx = i;
+              break;
+            }
+          }
+          m_cbRegion.SetCurSel2(selIdx);
+          g_lastMarkerRegionId = m_overlappingRegionIds.Get()[selIdx];
+        }
+
+        if (g_lastMarkerRegionId < 0 && m_overlappingRegionIds.GetSize() > 0) {
+          int selIdx = m_cbRegion.GetCurSel2();
+          if (selIdx < 0) selIdx = 0;
+          g_lastMarkerRegionId = m_overlappingRegionIds.Get()[selIdx];
+        }
+
+        if (g_locked) {
+          int uniqueActorCount = 0;
+          int unknownActorCount = 0;
+          const char *firstActor = NULL;
+          for (int i = 0; i < m_overlappingRegionIds.GetSize(); i++) {
+            SNM_RegionSubtitle *sub = subs->Get(m_overlappingRegionIds.Get()[i]);
+            const char *actor = sub->GetActor();
+            if (!actor || !*actor || !strcmp(actor, "?"))
+              unknownActorCount++;
+            if (!actor || !*actor) actor = "?";
+            if (!firstActor) {
+              firstActor = actor;
+              uniqueActorCount = 1;
+            } else if (strcmp(firstActor, actor)) {
+              uniqueActorCount = 2;
+            }
+          }
+          bool showDefaultPrefix = uniqueActorCount >= 2 || unknownActorCount >= 2;
+
+          WDL_FastString displayText;
+          bool first = true;
+          for (int i = 0; i < m_overlappingRegionIds.GetSize(); i++) {
+            SNM_RegionSubtitle *sub = subs->Get(m_overlappingRegionIds.Get()[i]);
+            if (!first)
+              displayText.Append("\r\n");
+            const char *actor = sub->GetActor();
+            bool hasActor = actor && *actor && strcmp(actor, "?");
+            if (hasActor || showDefaultPrefix)
+              AppendDisplayLine(&displayText, hasActor ? actor : "?", sub->GetNotes());
+            else
+              displayText.Append(sub->GetNotes());
+            first = false;
+          }
+          SetText(displayText.Get());
+        } else if (g_lastMarkerRegionId >= 0) {
+          SNM_RegionSubtitle *sub = subs->Get(g_lastMarkerRegionId);
+          if (sub)
+            SetText(sub->GetNotes());
 				}
 				refreshType = REQUEST_REFRESH;
-			}
-		}
-		else if (g_lastMarkerRegionId>0 || *g_lastText)
-		{
+      } else if (g_lastMarkerRegionId >= 0 || *g_lastText) {
 			g_lastMarkerPos = -1.0;
 			g_lastMarkerRegionId = -1;
+        m_overlappingRegionIds.Resize(0);
+        m_cbRegion.Empty();
 			SetText("");
 			refreshType = REQUEST_REFRESH;
 		}
+    } else {
+      int id, idx = FindMarkerRegion(NULL, dPos, SNM_REGION_MASK, &id);
+		if (id > 0)
+		{
+        WDL_TypedBuf<int> newOverlappingIds;
+        int enumIdx = 0;
+        bool isRgn;
+        double p1, p2;
+        int num;
+        while ((enumIdx = EnumProjectMarkers2(NULL, enumIdx, &isRgn, &p1, &p2, NULL, &num))) {
+          if (isRgn && dPos >= p1 && dPos <= p2) {
+            int regionId = MakeMarkerRegionId(num, true);
+            for (int i = 0; i < g_pRegionSubs.Get()->GetSize(); i++) {
+              if (g_pRegionSubs.Get()->Get(i)->GetId() == regionId) {
+                newOverlappingIds.Add(regionId);
+                break;
+              }
+            }
+          }
+        }
+
+        bool regionsChanged = false;
+        if (newOverlappingIds.GetSize() != m_overlappingRegionIds.GetSize())
+          regionsChanged = true;
+        else {
+          for (int i = 0; i < newOverlappingIds.GetSize(); i++) {
+            if (newOverlappingIds.Get()[i] != m_overlappingRegionIds.Get()[i]) {
+              regionsChanged = true;
+              break;
+            }
+          }
+        }
+
+        if (regionsChanged) {
+          m_overlappingRegionIds.Resize(newOverlappingIds.GetSize());
+          memcpy(m_overlappingRegionIds.Get(),
+                 newOverlappingIds.Get(),
+                 newOverlappingIds.GetSize() * sizeof(int));
+
+          m_cbRegion.Empty();
+          for (int i = 0; i < m_overlappingRegionIds.GetSize(); i++) {
+            int regId = m_overlappingRegionIds.Get()[i];
+            for (int j = 0; j < g_pRegionSubs.Get()->GetSize(); j++) {
+              SNM_RegionSubtitle *sub = g_pRegionSubs.Get()->Get(j);
+              if (sub->GetId() == regId) {
+                char itemText[256];
+                const char *actor = sub->GetActor();
+                if (actor && *actor)
+                  snprintf(itemText, sizeof(itemText), "%s", actor);
+                else {
+                  double pos, end;
+                  int num;
+                  if (EnumMarkerRegionById(NULL, regId, NULL, &pos, &end, NULL, &num, NULL) >= 0)
+                    snprintf(itemText, sizeof(itemText), "R%d", num);
+                  else
+                    snprintf(itemText, sizeof(itemText), "Region %d", i + 1);
+                }
+                m_cbRegion.AddItem(itemText);
+                break;
+              }
+            }
+          }
+
+          int selIdx = 0;
+          for (int i = 0; i < m_overlappingRegionIds.GetSize(); i++) {
+            if (m_overlappingRegionIds.Get()[i] == g_lastMarkerRegionId)
+			{
+              selIdx = i;
+              break;
+            }
+          }
+          m_cbRegion.SetCurSel2(selIdx);
+
+          if (m_overlappingRegionIds.GetSize() > 0)
+            g_lastMarkerRegionId = m_overlappingRegionIds.Get()[selIdx];
+        }
+
+        if (g_lastMarkerRegionId <= 0 && m_overlappingRegionIds.GetSize() > 0) {
+          int selIdx = m_cbRegion.GetCurSel2();
+          if (selIdx < 0) selIdx = 0;
+          g_lastMarkerRegionId = m_overlappingRegionIds.Get()[selIdx];
+        }
+
+        if (g_locked && m_overlappingRegionIds.GetSize() > 0) {
+          int uniqueActorCount = 0;
+          int unknownActorCount = 0;
+          const char *firstActor = NULL;
+          for (int i = 0; i < m_overlappingRegionIds.GetSize(); i++) {
+            int regId = m_overlappingRegionIds.Get()[i];
+            for (int j = 0; j < g_pRegionSubs.Get()->GetSize(); j++) {
+              SNM_RegionSubtitle *sub = g_pRegionSubs.Get()->Get(j);
+              if (sub->GetId() == regId)
+				{
+					const char*actor = sub->GetActor();
+                if (!actor || !*actor || !strcmp(actor, "?"))
+                  unknownActorCount++;
+                if (!actor || !*actor) actor = "?";
+                if (!firstActor) {
+                  firstActor = actor;
+                  uniqueActorCount = 1;
+                } else if (strcmp(firstActor, actor)) {
+                  uniqueActorCount = 2;
+                }
+                break;
+              }
+            }
+          }
+          bool showDefaultPrefix = uniqueActorCount >= 2 || unknownActorCount >= 2;
+
+          WDL_FastString displayText;
+          bool first = true;
+          for (int i = 0; i < m_overlappingRegionIds.GetSize(); i++) {
+            int regId = m_overlappingRegionIds.Get()[i];
+            for (int j = 0; j < g_pRegionSubs.Get()->GetSize(); j++) {
+              SNM_RegionSubtitle *sub = g_pRegionSubs.Get()->Get(j);
+              if (sub->GetId() == regId) {
+                if (!first)
+                  displayText.Append("\r\n");
+                const char *actor = sub->GetActor();
+                bool hasActor = actor && *actor && strcmp(actor, "?");
+                if (hasActor || showDefaultPrefix)
+                  AppendDisplayLine(&displayText, hasActor ? actor : "?", sub->GetNotes());
+                else
+                  displayText.Append(sub->GetNotes());
+                first = false;
+                break;
+              }
+            }
+          }
+          SetText(displayText.Get());
+        } else if (g_lastMarkerRegionId > 0) {
+          bool found = false;
+          for (int i = 0; i < g_pRegionSubs.Get()->GetSize(); i++) {
+            SNM_RegionSubtitle *sub = g_pRegionSubs.Get()->Get(i);
+            if (sub->GetId() == g_lastMarkerRegionId) {
+              SetText(sub->GetNotes());
+              found = true;
+              break;
+            }
+          }
+          if (!found) {
+            SetText("");
+          }
+        } else {
+          SetText("");
+        }
+        refreshType = REQUEST_REFRESH;
+      } else if (g_lastMarkerRegionId > 0 || *g_lastText) {
+        g_lastMarkerPos = -1.0;
+        g_lastMarkerRegionId = -1;
+        m_overlappingRegionIds.Resize(0);
+        m_cbRegion.Empty();
+					SetText("");
+        refreshType = REQUEST_REFRESH;
+      }
+    }
 	}
 	return refreshType;
 }
 
-void NotesWnd::ForceUpdateMkrRgnNameOrSub(int _type)
-{
-	double dPos = GetCursorPositionEx(NULL);
-	if (g_locked && GetPlayStateEx(NULL)) { // playing & update required?
-		dPos = GetPlayPositionEx(NULL);
+void NotesWnd::ForceUpdateRgnSub() {
+  if (g_locked && m_overlappingRegionIds.GetSize() > 0) {
+    int uniqueActorCount = 0;
+    int unknownActorCount = 0;
+    const char *firstActor = NULL;
+    WDL_PtrList_DOD<SNM_RegionSubtitle> *subs = g_pRegionSubs.Get();
+    for (int i = 0; i < m_overlappingRegionIds.GetSize(); i++) {
+      SNM_RegionSubtitle *sub = NULL;
+      if (g_hideRegions) {
+        sub = subs->Get(m_overlappingRegionIds.Get()[i]);
+				}
+				else {
+        int regId = m_overlappingRegionIds.Get()[i];
+        for (int j = 0; j < subs->GetSize(); j++) {
+          if (subs->Get(j)->GetId() == regId) {
+            sub = subs->Get(j);
+            break;
 	}
+        }
+      }
+      if (!sub) continue;
+      const char *actor = sub->GetActor();
+      if (!actor || !*actor || !strcmp(actor, "?"))
+        unknownActorCount++;
+      if (!actor || !*actor) actor = "?";
+      if (!firstActor) {
+        firstActor = actor;
+        uniqueActorCount = 1;
+      } else if (strcmp(firstActor, actor)) {
+        uniqueActorCount = 2;
+      }
+    }
+    bool showDefaultPrefix = uniqueActorCount >= 2 || unknownActorCount >= 2;
 
-	int mask = 0;
-	if (_type != SNM_NOTES_MKR_NAME && _type != SNM_NOTES_MKR_SUB)
-		mask |= SNM_REGION_MASK;
-	if (_type != SNM_NOTES_RGN_NAME && _type != SNM_NOTES_RGN_SUB)
-		mask |= SNM_MARKER_MASK;
-
-	int id; FindMarkerRegion(NULL, dPos, mask, &id);
-	if (id > 0)
-	{
-		for (int i = 0; i < g_pRegionSubs.Get()->GetSize(); i++)
-			if (g_pRegionSubs.Get()->Get(i)->GetId() == id) {
-				SetText(g_pRegionSubs.Get()->Get(i)->GetNotes());
+    WDL_FastString displayText;
+    bool first = true;
+    for (int i = 0; i < m_overlappingRegionIds.GetSize(); i++) {
+      SNM_RegionSubtitle *sub = NULL;
+      if (g_hideRegions) {
+        sub = subs->Get(m_overlappingRegionIds.Get()[i]);
+      } else {
+        int regId = m_overlappingRegionIds.Get()[i];
+        for (int j = 0; j < subs->GetSize(); j++) {
+          if (subs->Get(j)->GetId() == regId) {
+            sub = subs->Get(j);
+            break;
+          }
+        }
+      }
+      if (!sub) continue;
+      if (!first)
+        displayText.Append("\r\n");
+      const char *actor = sub->GetActor();
+      bool hasActor = actor && *actor && strcmp(actor, "?");
+      if (hasActor || showDefaultPrefix)
+        AppendDisplayLine(&displayText, hasActor ? actor : "?", sub->GetNotes());
+      else
+        displayText.Append(sub->GetNotes());
+      first = false;
+    }
+    SetText(displayText.Get());
+    RefreshGUI();
+  } else if (g_hideRegions ? g_lastMarkerRegionId >= 0 : g_lastMarkerRegionId > 0) {
+    if (g_hideRegions) {
+      SNM_RegionSubtitle *sub = g_pRegionSubs.Get()->Get(g_lastMarkerRegionId);
+      if (sub) {
+        SetText(sub->GetNotes());
 				if (g_locked)
 					RefreshGUI();
-				return;
 			}
-	}
-}
-
-
-///////////////////////////////////////////////////////////////////////////////
-
-#ifdef WANT_ACTION_HELP
-// load/save action help (from/to ini file)
-// note: WDL's cfg_encode_textblock() & decode_textblock() will not help here..
-
-void LoadHelp(const char* _cmdName, char* _buf, int _bufSize)
-{
-	if (_cmdName && *_cmdName && _buf && _bufSize>0)
-	{
-		// "buf" filled with null-terminated strings, double null-terminated
-		char buf[MAX_HELP_LENGTH] = "";
-		if (/*int sz = */ GetPrivateProfileSection(_cmdName,buf,sizeof(buf),g_actionHelpFn))
-		{
-//			memset(_buf, 0, _bufSize);
-
-			// GetPrivateProfileSection() sucks: "sz" does not include the very final '\0' (why not)
-			// *but* it does not include the final "\0\0" when it truncates either (inconsistent)
-			// => do not use "sz"
-
-			int i=-1, j=0;
-			while (++i<sizeof(buf) && j<_bufSize)
-			{
-				if (!buf[i])
-				{
-					if ((i+1)>=sizeof(buf) || !buf[i+1]) // check double null-terminated
+    } else {
+					for (int i=0; i < g_pRegionSubs.Get()->GetSize(); i++) {
+        SNM_RegionSubtitle *sub = g_pRegionSubs.Get()->Get(i);
+        if (sub->GetId() == g_lastMarkerRegionId) {
+							SetText(sub->GetNotes());
+				if (g_locked)
+					RefreshGUI();
 						break;
-					_buf[j++] = '\n'; // done this way for ascendant compatibilty
-				}
-				else if (buf[i] != '|')
-					_buf[j++] = buf[i];
 			}
-			_buf[j<_bufSize?j:_bufSize-1] = '\0';
-		}
 	}
 }
+	}
+	}
 
-// adds '|' at start of lines, empty lines would be
-// scratched by GetPrivateProfileSection() otherwise
-//JFB!!! todo [section_custId]
-void SaveHelp(const char* _cmdName, const char* _help)
-{
-	if (_cmdName && *_cmdName && _help)
-	{
-		char buf[MAX_HELP_LENGTH] = "";
-//		memset(buf, 0, MAX_HELP_LENGTH);
-		if (*_help)
-		{
-			*buf = '|';
-			int i=-1;
-			int j=1; // 1 because '|' was inserted above
-			while (_help[++i] && j<sizeof(buf))
-			{
-				if (_help[i] != '\r')
-				{
-					buf[j++] = _help[i];
-					if (_help[i] == '\n' && j<sizeof(buf))
-						buf[j++] = '|';
-				}
-			}
-			j = j>MAX_HELP_LENGTH-2 ? MAX_HELP_LENGTH-2 : j; // if truncated, clamp for double null-termination
-			buf[j] = '\0';
-			buf[j+1] = '\0';
-		}
-		WritePrivateProfileStruct(_cmdName, NULL, NULL, 0, g_actionHelpFn); // flush section
-		WritePrivateProfileSection(_cmdName, buf, g_actionHelpFn);
-	}
-}
-
-void SetActionHelpFilename(COMMAND_T*) {
-	if (char* fn = BrowseForFiles(__LOCALIZE("S&M - Set action help file","sws_DLG_152"), g_actionHelpFn, NULL, false, SNM_INI_EXT_LIST)) {
-		lstrcpyn(g_actionHelpFn, fn, sizeof(g_actionHelpFn));
-		free(fn);
-	}
-}
-#endif
 
 ///////////////////////////////////////////////////////////////////////////////
 // Encode/decode notes (to/from RPP format)
@@ -1269,6 +2263,11 @@ bool GetNotesChunkFromString(const char* _bufIn, WDL_FastString* _notesOut, cons
 ///////////////////////////////////////////////////////////////////////////////
 
 void NotesUpdateJob::Perform() {
+	if (g_pendingRegionRecreation) {
+    g_pendingRegionRecreation = false;
+    if (!g_hideRegions)
+      ShowAllRegions();
+  }
 	if (NotesWnd* w = g_notesWndMgr.Get())
 		w->Update(true);
 }
@@ -1281,11 +2280,7 @@ void NotesUpdateJob::Perform() {
 // ScheduledJob because of multi-notifs during project switches (vs CSurfSetTrackListChange)
 void NotesMarkerRegionListener::NotifyMarkerRegionUpdate(int _updateFlags)
 {
-	if (g_notesType>=SNM_NOTES_MKR_SUB && g_notesType<=SNM_NOTES_MKRRGN_SUB)
-	{
-		ScheduledJob::Schedule(new NotesUpdateJob(SNM_SCHEDJOB_ASYNC_DELAY_OPT));
-	}
-	else if (g_notesType>=SNM_NOTES_MKR_NAME && g_notesType<=SNM_NOTES_MKRRGN_NAME)
+	if (g_notesType == SNM_NOTES_RGN_SUB)
 	{
 		if (g_internalMkrRgnChange)
 			g_internalMkrRgnChange = false;
@@ -1297,9 +2292,544 @@ void NotesMarkerRegionListener::NotifyMarkerRegionUpdate(int _updateFlags)
 
 ///////////////////////////////////////////////////////////////////////////////
 
-// import/export subtitle files, only SubRip (.srt) files atm
-// see http://en.wikipedia.org/wiki/SubRip#Specifications
+void StripAssFormattingTags(WDL_FastString *text) {
+  WDL_FastString result;
+  const char *p = text->Get();
+  while (*p) {
+    if (*p == '{' && *(p + 1) == '\\') {
+      while (*p && *p != '}')
+        p++;
+      if (*p == '}')
+        p++;
+    } else if (*p == '\\' && (*(p + 1) == 'N' || *(p + 1) == 'n')) {
+      result.Append("\n");
+      p += 2;
+    } else {
+      result.Append(p, 1);
+      p++;
+    }
+  }
+  text->Set(result.Get());
+}
 
+void StripSrtFormattingTags(WDL_FastString *text) {
+  WDL_FastString result;
+  const char *p = text->Get();
+  while (*p) {
+    if (*p == '<') {
+      while (*p && *p != '>')
+        p++;
+      if (*p == '>')
+        p++;
+    } else {
+      result.Append(p, 1);
+      p++;
+    }
+  }
+  text->Set(result.Get());
+}
+
+static double OklchSrgbGamma(double x) {
+  if (x >= 0.0031308)
+    return 1.055 * pow(x, 1.0 / 2.4) - 0.055;
+  return 12.92 * x;
+}
+
+int GenerateActorColor(const char *actorName) {
+  unsigned int hash = 2166136261u;
+  const char *p = actorName;
+  while (*p) {
+    hash ^= (unsigned char) *p++;
+    hash *= 16777619u;
+  }
+  hash ^= hash >> 16;
+  hash *= 0x45d9f3bu;
+  hash ^= hash >> 16;
+
+  double hDeg = ((hash & 0x3FF) / 1024.0) * 360.0;
+  double ch = 0.08 + ((hash >> 10) & 0xFF) / 255.0 * 0.09;
+  double lk = 0.45 + ((hash >> 18) & 0xFF) / 255.0 * 0.20;
+
+  double hRad = hDeg * (3.14159265358979323846 / 180.0);
+  double a = ch * cos(hRad);
+  double b = ch * sin(hRad);
+
+  double l_ = lk + 0.3963377774 * a + 0.2158037573 * b;
+  double m_ = lk - 0.1055613458 * a - 0.0638541728 * b;
+  double s_ = lk - 0.0894841775 * a - 1.2914855480 * b;
+
+  double l = l_ * l_ * l_;
+  double m = m_ * m_ * m_;
+  double s = s_ * s_ * s_;
+
+  double rd = +4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s;
+  double gd = -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s;
+  double bd = -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s;
+
+  if (rd < 0.0) rd = 0.0;
+  else if (rd > 1.0) rd = 1.0;
+  if (gd < 0.0) gd = 0.0;
+  else if (gd > 1.0) gd = 1.0;
+  if (bd < 0.0) bd = 0.0;
+  else if (bd > 1.0) bd = 1.0;
+
+  int ri = (int) (OklchSrgbGamma(rd) * 255.0 + 0.5);
+  int gi = (int) (OklchSrgbGamma(gd) * 255.0 + 0.5);
+  int bi = (int) (OklchSrgbGamma(bd) * 255.0 + 0.5);
+
+  return RGB(ri, gi, bi) | 0x1000000;
+}
+
+int SNM_Actor::GetEffectiveColor() const {
+  if (m_hasCustomColor)
+    return m_color;
+  if (m_linkedActorName.GetLength() > 0)
+    return GenerateActorColor(m_linkedActorName.Get());
+  return m_color;
+}
+
+SNM_Actor *FindOrCreateActor(const char *name) {
+  WDL_PtrList_DOD<SNM_Actor> *actors = g_actors.Get();
+  for (int i = 0; i < actors->GetSize(); i++)
+    if (!strcmp(actors->Get(i)->GetName(), name))
+      return actors->Get(i);
+  int color = strcmp(name, "?") ? GenerateActorColor(name) : 0;
+  SNM_Actor *actor = new SNM_Actor(name, color);
+  actors->Add(actor);
+  return actor;
+}
+
+void CleanupStaleActors() {
+  WDL_PtrList_DOD<SNM_Actor> *actors = g_actors.Get();
+  WDL_PtrList_DOD<SNM_RegionSubtitle> *subs = g_pRegionSubs.Get();
+
+  for (int i = actors->GetSize() - 1; i >= 0; i--) {
+    SNM_Actor *actor = actors->Get(i);
+    bool hasSubtitle = false;
+
+    for (int j = 0; j < subs->GetSize(); j++) {
+      SNM_RegionSubtitle *sub = subs->Get(j);
+      if (!strcmp(sub->GetActor(), actor->GetName())) {
+        hasSubtitle = true;
+        break;
+      }
+    }
+
+    if (!hasSubtitle) {
+      actors->Delete(i, true);
+    }
+  }
+}
+
+enum { COL_ENABLED = 0, COL_NAME, COL_COUNT };
+
+static SWS_LVColumn g_actorCols[] = {
+  {30, 2, ""},
+  {100, 0, "Actor"}
+};
+
+ActorListView::ActorListView(HWND hwndList, HWND hwndEdit)
+  : SWS_ListView(hwndList,
+                 hwndEdit,
+                 COL_COUNT,
+                 g_actorCols,
+                 "ACTORLISTVIEWSTATE",
+                 false,
+                 "sws_DLG_152") {
+  m_iSortCol = COL_NAME + 1;
+}
+
+void ActorListView::GetItemList(SWS_ListItemList *pList) {
+  WDL_PtrList_DOD<SNM_Actor> *actors = g_actors.Get();
+  for (int i = 0; i < actors->GetSize(); i++)
+    pList->Add((SWS_ListItem *) new ActorListItem(actors->Get(i)), false);
+}
+
+void ActorListView::GetItemText(SWS_ListItem *item, int iCol, char *str, int iStrMax) {
+  if (!item || !str || iStrMax <= 0) {
+    if (str && iStrMax > 0) str[0] = 0;
+    return;
+  }
+
+  ActorListItem *actorItem = (ActorListItem *) item;
+  if (!actorItem || !actorItem->actor) {
+    str[0] = 0;
+    return;
+  }
+
+  SNM_Actor *actor = actorItem->actor;
+
+  switch (iCol) {
+    case COL_ENABLED:
+#ifdef _WIN32
+      lstrcpyn(str, actor->IsEnabled() ? UTF8_CHECKMARK : "", iStrMax);
+#else
+      lstrcpyn(str, actor->IsEnabled() ? "+" : "-", iStrMax);
+#endif
+      break;
+    case COL_NAME:
+#ifdef _WIN32
+      lstrcpyn(str, actor->GetName(), iStrMax);
+#else
+      if (actor->HasLinkedActor()) {
+        snprintf(str, iStrMax, "[%s] %s", actor->GetLinkedActorName(), actor->GetName());
+      } else {
+        lstrcpyn(str, actor->GetName(), iStrMax);
+      }
+#endif
+      break;
+    default:
+      str[0] = 0;
+      break;
+  }
+}
+
+int ActorListView::OnItemSort(SWS_ListItem *item1, SWS_ListItem *item2) {
+  ActorListItem *actorItem1 = (ActorListItem *) item1;
+  ActorListItem *actorItem2 = (ActorListItem *) item2;
+
+  if (!actorItem1 || !actorItem1->actor || !actorItem2 || !actorItem2->actor)
+    return 0;
+
+  int result = _stricmp(actorItem1->actor->GetName(), actorItem2->actor->GetName());
+
+  if (m_iSortCol < 0)
+    return -result;
+  return result;
+}
+
+void ActorListView::OnItemClk(SWS_ListItem *item, int iCol, int iKeyState) {
+  if (!item)
+    return;
+
+  ActorListItem *actorItem = (ActorListItem *) item;
+  if (!actorItem || !actorItem->actor)
+    return;
+
+  SNM_Actor *clickedActor = actorItem->actor;
+  WDL_PtrList_DOD<SNM_Actor> *actors = g_actors.Get();
+
+  if (iKeyState & LVKF_SHIFT) {
+    bool clickedEnabled = clickedActor->IsEnabled();
+
+    bool othersEnabled = false;
+    for (int i = 0; i < actors->GetSize(); i++) {
+      SNM_Actor *a = actors->Get(i);
+      if (a != clickedActor && a->IsEnabled()) {
+        othersEnabled = true;
+        break;
+      }
+    }
+
+    if (!clickedEnabled) {
+      for (int i = 0; i < actors->GetSize(); i++) {
+        SNM_Actor *a = actors->Get(i);
+        if (a == clickedActor) {
+          a->SetEnabled(true);
+          RecreateActorRegions(a->GetName());
+        } else if (a->IsEnabled()) {
+          a->SetEnabled(false);
+          DeleteActorRegions(a->GetName());
+        }
+      }
+    } else if (othersEnabled) {
+      for (int i = 0; i < actors->GetSize(); i++) {
+        SNM_Actor *a = actors->Get(i);
+        if (a != clickedActor && a->IsEnabled()) {
+          a->SetEnabled(false);
+          DeleteActorRegions(a->GetName());
+        }
+      }
+    } else {
+      for (int i = 0; i < actors->GetSize(); i++) {
+        SNM_Actor *a = actors->Get(i);
+        if (a == clickedActor) {
+          a->SetEnabled(false);
+          DeleteActorRegions(a->GetName());
+        } else {
+          a->SetEnabled(true);
+          RecreateActorRegions(a->GetName());
+        }
+      }
+    }
+    UpdateTimeline();
+  } else {
+    bool newState = !clickedActor->IsEnabled();
+    clickedActor->SetEnabled(newState);
+
+    if (newState)
+      RecreateActorRegions(clickedActor->GetName());
+    else {
+      DeleteActorRegions(clickedActor->GetName());
+      UpdateTimeline();
+    }
+  }
+
+  if (g_hideRegions)
+    g_lastMarkerPos = -1.0;
+  Update();
+}
+
+bool ActorListView::CustomDrawItem(HDC hdc, SWS_ListItem *item, int iCol, RECT *r, bool selected) {
+  if (!item || !hdc || !r)
+    return false;
+
+  ActorListItem *actorItem = (ActorListItem *) item;
+  if (!actorItem || !actorItem->actor)
+    return false;
+
+  int sz;
+  ColorTheme *ctheme = (ColorTheme *) GetColorThemeStruct(&sz);
+  if (!ctheme || sz < (int) sizeof(ColorTheme))
+    return false;
+
+  int bgColor = selected
+                  ? (GetFocus() == m_hwndList
+                       ? ctheme->genlist_sel[0]
+                       : ctheme->genlist_selinactive[0])
+                  : ctheme->genlist_bg;
+  HBRUSH bgBrush = CreateSolidBrush(bgColor);
+  FillRect(hdc, r, bgBrush);
+  DeleteObject(bgBrush);
+
+  int gridColor = ctheme->genlist_gridlines;
+  if (gridColor != bgColor && iCol == COL_NAME) {
+    RECT listRect;
+    GetClientRect(m_hwndList, &listRect);
+    HPEN pen = CreatePen(PS_SOLID, 0, gridColor);
+    HGDIOBJ oldPen = SelectObject(hdc, pen);
+    MoveToEx(hdc, listRect.left, r->bottom - 1, NULL);
+    LineTo(hdc, listRect.right, r->bottom - 1);
+    SelectObject(hdc, oldPen);
+    DeleteObject(pen);
+  }
+
+  if (iCol == COL_ENABLED) {
+    int textColor = selected
+                      ? (GetFocus() == m_hwndList
+                           ? ctheme->genlist_sel[1]
+                           : ctheme->genlist_selinactive[1])
+                      : ctheme->genlist_fg;
+    SetTextColor(hdc, textColor);
+    SetBkMode(hdc, TRANSPARENT);
+    const char *text = actorItem->actor->IsEnabled() ? UTF8_CHECKMARK : "";
+    DrawTextUTF8(hdc, text, -1, r, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+  } else if (iCol == COL_NAME) {
+    int h = r->bottom - r->top;
+    int dotSize = 8;
+    int dotX = r->left + 6;
+    int textLeft = dotX + dotSize + 4;
+
+    int dotColor = actorItem->actor->GetEffectiveColor();
+    HBRUSH dotBrush = CreateSolidBrush((dotColor ? dotColor : ctheme->region) & 0xFFFFFF);
+
+    int textColor = selected
+                      ? (GetFocus() == m_hwndList
+                           ? ctheme->genlist_sel[1]
+                           : ctheme->genlist_selinactive[1])
+                      : ctheme->genlist_fg;
+    SetBkMode(hdc, TRANSPARENT);
+
+    if (actorItem->actor->HasLinkedActor()) {
+      int halfH = h / 2;
+      int dotY = r->top + (halfH - dotSize) / 2;
+      RECT dotRect = {dotX, dotY, dotX + dotSize, dotY + dotSize};
+      FillRect(hdc, &dotRect, dotBrush);
+
+      SetTextColor(hdc, textColor);
+      RECT topRect = {textLeft, r->top, r->right, r->top + halfH};
+      DrawTextUTF8(hdc,
+                   actorItem->actor->GetName(),
+                   -1,
+                   &topRect,
+                   DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+
+      int linkedColor = actorItem->actor->GetEffectiveColor();
+      SetTextColor(hdc, (linkedColor ? linkedColor : ctheme->region) & 0xFFFFFF);
+      RECT botRect = {textLeft, r->top + halfH, r->right, r->bottom};
+      DrawTextUTF8(hdc,
+                   actorItem->actor->GetLinkedActorName(),
+                   -1,
+                   &botRect,
+                   DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    } else {
+      int dotY = r->top + (h - dotSize) / 2;
+      RECT dotRect = {dotX, dotY, dotX + dotSize, dotY + dotSize};
+      FillRect(hdc, &dotRect, dotBrush);
+
+      SetTextColor(hdc, textColor);
+      RECT textRect = {textLeft, r->top, r->right, r->bottom};
+      DrawTextUTF8(hdc,
+                   actorItem->actor->GetName(),
+                   -1,
+                   &textRect,
+                   DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    }
+    DeleteObject(dotBrush);
+  }
+
+  return true;
+}
+
+bool ActorListView::GetCustomColumnColor(SWS_ListItem *item,
+                                         int iCol,
+                                         bool selected,
+                                         COLORREF *textColor) {
+  if (!item || !textColor)
+    return false;
+
+  ActorListItem *actorItem = (ActorListItem *) item;
+  if (!actorItem || !actorItem->actor)
+    return false;
+
+  if (iCol == COL_NAME) {
+    int sz;
+    ColorTheme *ctheme = (ColorTheme *) GetColorThemeStruct(&sz);
+    int color = actorItem->actor->GetEffectiveColor();
+    if (color) {
+      *textColor = color & 0xFFFFFF;
+      return true;
+    }
+    if (ctheme && sz >= (int) sizeof(ColorTheme)) {
+      *textColor = ctheme->region & 0xFFFFFF;
+      return true;
+    }
+  }
+
+  return false;
+}
+
+bool ImportAssFile(const char *_fn) {
+  bool ok = false;
+  double firstPos = -1.0;
+  bool inEventsSection = false;
+
+  if (FILE *f = fopenUTF8(_fn, "rt")) {
+    char buf[4096];
+    if (fgets(buf, 4, f) && strcmp("\xEF\xBB\xBF", buf))
+      rewind(f);
+
+    while (fgets(buf, sizeof(buf), f)) {
+      if (buf[0] == '[') {
+        inEventsSection = (_strnicmp(buf, "[Events]", 8) == 0);
+        continue;
+      }
+
+      if (!inEventsSection)
+        continue;
+
+      if (_strnicmp(buf, "Dialogue:", 9) != 0)
+        continue;
+
+      const char *p = buf + 9;
+      while (*p == ' ')
+        p++;
+
+      int field = 0;
+      int p1[3] = {0}, p1cs = 0;
+      int p2[3] = {0}, p2cs = 0;
+      const char *textStart = NULL;
+      const char *actorStart = NULL;
+      int actorLen = 0;
+      bool validTimes = true;
+
+      while (*p && field < 9) {
+        const char *fieldStart = p;
+        while (*p && *p != ',')
+          p++;
+
+        if (field == 1) {
+          if (sscanf(fieldStart, "%d:%d:%d.%d", &p1[0], &p1[1], &p1[2], &p1cs) != 4)
+            validTimes = false;
+        } else if (field == 2) {
+          if (sscanf(fieldStart, "%d:%d:%d.%d", &p2[0], &p2[1], &p2[2], &p2cs) != 4)
+            validTimes = false;
+        } else if (field == 4) {
+          actorStart = fieldStart;
+          const char *actorEnd = p;
+          actorLen = (int) (actorEnd - actorStart);
+        }
+
+        if (*p == ',')
+          p++;
+        field++;
+      }
+
+      if (field == 9)
+        textStart = p;
+
+      if (!validTimes)
+        continue;
+
+      if (!textStart || !*textStart)
+        continue;
+
+      const char *textEnd = textStart;
+      while (*textEnd && *textEnd != '\r' && *textEnd != '\n')
+        textEnd++;
+
+      WDL_FastString notes;
+      notes.Append(textStart, (int) (textEnd - textStart));
+      StripAssFormattingTags(&notes);
+
+      WDL_FastString actor;
+      if (actorStart && actorLen > 0)
+        actor.Append(actorStart, actorLen);
+      else
+        actor.Set("?");
+
+      SNM_Actor *actorObj = FindOrCreateActor(actor.Get());
+
+      WDL_String name;
+      BuildRegionName(&name, actor.Get(), notes.Get());
+
+      double startTime = p1[0] * 3600 + p1[1] * 60 + p1[2] + double(p1cs) / 100;
+      double endTime = p2[0] * 3600 + p2[1] * 60 + p2[2] + double(p2cs) / 100;
+
+      if (g_hideRegions) {
+        SNM_RegionSubtitle *sub = new SNM_RegionSubtitle(nullptr, -1, notes.Get());
+        sub->SetActor(actor.Get());
+        sub->SetTimes(startTime, endTime);
+        g_pRegionSubs.Get()->Add(sub);
+        ok = true;
+        if (firstPos < 0.0) firstPos = startTime;
+      } else {
+        int color = g_coloredRegions ? actorObj->GetEffectiveColor() : 0;
+        int num = AddProjectMarker2(NULL,
+                                    true,
+                                    startTime,
+                                    endTime,
+                                    name.Get(),
+                                    -1,
+                                    color);
+        if (num >= 0) {
+          ok = true;
+          if (firstPos < 0.0)
+            firstPos = startTime;
+          int id = MakeMarkerRegionId(num, true);
+          if (id > 0) {
+            SNM_RegionSubtitle *sub = new SNM_RegionSubtitle(nullptr, id, notes.Get());
+            sub->SetActor(actor.Get());
+            sub->SetTimes(startTime, endTime);
+            g_pRegionSubs.Get()->Add(sub);
+          }
+        }
+      }
+    }
+    fclose(f);
+  }
+
+  if (ok) {
+    if (!g_hideRegions)
+      UpdateTimeline();
+    if (firstPos > 0.0)
+      SetEditCurPos2(NULL, firstPos, true, false);
+  }
+  return ok;
+}
+
+// Import subtitles in the SubRip (.srt) format.
+// See https://en.wikipedia.org/wiki/SubRip#Specifications.
 bool ImportSubRipFile(const char* _fn)
 {
 	bool ok = false;
@@ -1330,31 +2860,46 @@ bool ImportSubRipFile(const char* _fn)
 						if (*buf == '\r' || *buf == '\n') break;
 						notes.Append(buf);
 					}
+          StripSrtFormattingTags(&notes);
           
-					WDL_String name(notes.Get());
-					char *p=name.Get();
-					while (*p) {
-						if (*p == '\r' || *p == '\n') *p=' ';
-						p++;
-					}
-					name.Ellipsize(0, 64); // 64 = native max mkr/rgn name length
+          SNM_Actor *actorObj = FindOrCreateActor("?");
 
-					num = AddProjectMarker(NULL, true,
-						p1[0]*3600 + p1[1]*60 + p1[2] + double(p1[3])/1000, 
-						p2[0]*3600 + p2[1]*60 + p2[2] + double(p2[3])/1000, 
-						name.Get(), num);
+          WDL_String name;
+          BuildRegionName(&name, "?", notes.Get());
 
-					if (num >= 0)
-					{
-						ok = true; // region added (at least)
+          double startTime = p1[0]*3600 + p1[1]*60 + p1[2] + double(p1[3])/1000;
+          double endTime = p2[0] * 3600 + p2[1] * 60 + p2[2] + double(p2[3]) / 1000;
+
+          if (g_hideRegions) {
+            SNM_RegionSubtitle *sub = new SNM_RegionSubtitle(nullptr, -1, notes.Get(), "?");
+            sub->SetTimes(startTime, endTime);
+            g_pRegionSubs.Get()->Add(sub);
+            ok = true;
+            if (firstPos < 0.0) firstPos = startTime;
+          } else {
+            int color = g_coloredRegions ? actorObj->GetEffectiveColor() : 0;
+            num = AddProjectMarker2(NULL,
+                                    true,
+                                    startTime,
+                                    endTime,
+                                    name.Get(),
+                                    num,
+                                    color);
+
+            if (num >= 0) {
+              ok = true;
 
 						if (firstPos < 0.0)
-							firstPos = p1[0]*3600 + p1[1]*60 + p1[2] + double(p1[3])/1000;
+                firstPos = startTime;
 
 						int id = MakeMarkerRegionId(num, true);
-						if (id > 0) // add the sub, no duplicate mgmt..
-							g_pRegionSubs.Get()->Add(new SNM_RegionSubtitle(nullptr, id, notes.Get()));
+						if (id > 0) {
+                SNM_RegionSubtitle *sub = new SNM_RegionSubtitle(nullptr, id, notes.Get(), "?");
+                sub->SetTimes(startTime, endTime);
+                g_pRegionSubs.Get()->Add(sub);
 					}
+				}
+          }
 				}
 				else
 					break;
@@ -1365,7 +2910,8 @@ bool ImportSubRipFile(const char* _fn)
 	
 	if (ok)
 	{
-		UpdateTimeline(); // redraw the ruler (andd arrange view)
+    if (!g_hideRegions)
+      UpdateTimeline();
 		if (firstPos > 0.0)
 			SetEditCurPos2(NULL, firstPos, true, false);
 	}
@@ -1374,87 +2920,307 @@ bool ImportSubRipFile(const char* _fn)
 
 void ImportSubTitleFile(COMMAND_T* _ct)
 {
-	if (char* fn = BrowseForFiles(__LOCALIZE("S&M - Import subtitle file","sws_DLG_152"), g_lastImportSubFn, NULL, false, SNM_SUB_EXT_LIST))
+	if (char* fn = BrowseForFiles(__LOCALIZE("ReNotes - Добавить субтитры","sws_DLG_152"), g_lastImportSubFn, NULL, false, SNM_SUB_EXT_LIST))
 	{
 		lstrcpyn(g_lastImportSubFn, fn, sizeof(g_lastImportSubFn));
-		if (ImportSubRipFile(fn))
-			//JFB hard-coded undo label: _ct might be NULL (when called from a button)
-			//    + avoid trailing "..." in undo point name (when called from an action)
-			Undo_OnStateChangeEx2(NULL, __LOCALIZE("Import subtitle file","sws_DLG_152"), UNDO_STATE_ALL, -1);
+    bool imported = false;
+    if (HasFileExtension(fn, "ASS"))
+      imported = ImportAssFile(fn);
 		else
-			MessageBox(GetMainHwnd(), __LOCALIZE("Invalid subtitle file!","sws_DLG_152"), __LOCALIZE("S&M - Error","sws_DLG_152"), MB_OK);
+      imported = ImportSubRipFile(fn);
+    if (imported) {
+      MarkProjectDirty(NULL);
+      if (NotesWnd *w = g_notesWndMgr.Get())
+        w->RefreshActorList();
+    } else
+			MessageBox(GetMainHwnd(), __LOCALIZE("Некорректный файл субтитров!","sws_DLG_152"), __LOCALIZE("ReNotes - Ошибка","sws_DLG_152"), MB_OK);
 		free(fn);
 	}
 }
 
-bool ExportSubRipFile(const char* _fn)
-{
-	if (FILE* f = fopenUTF8(_fn, "wt"))
-	{
-		WDL_FastString subs;
-		int x=0, subIdx=1, num; bool isRgn; double p1, p2;
-		while ((x = EnumProjectMarkers2(NULL, x, &isRgn, &p1, &p2, NULL, &num)))
-		{
-			// special case for markers: end position = next start position
-			if (!isRgn)
-			{
-				int x2=x;
-				if (!EnumProjectMarkers2(NULL, x2, NULL, &p2 /* <- the trick */, NULL, NULL, NULL))
-					p2 = p1 + 5.0; // best effort..
+void NotesWnd::OnDroppedFiles(HDROP h) {
+  if (g_notesType != SNM_NOTES_RGN_SUB) {
+    DragFinish(h);
+    return;
 			}
-
-			int id = MakeMarkerRegionId(num, isRgn);
-			if (id > 0)
-			{
-				for (int i=0; i < g_pRegionSubs.Get()->GetSize(); i++)
-				{
-					SNM_RegionSubtitle* rn = g_pRegionSubs.Get()->Get(i);
-					if (rn->GetId() == id)
-					{
-						subs.AppendFormatted(64, "%d\n", subIdx++); // subs have their own indexes
-						
-						int h, m, s, ms;
-						TranslatePos(p1, &h, &m, &s, &ms);
-						subs.AppendFormatted(64,"%02d:%02d:%02d,%03d --> ",h,m,s,ms);
-						TranslatePos(p2, &h, &m, &s, &ms);
-						subs.AppendFormatted(64,"%02d:%02d:%02d,%03d\n",h,m,s,ms);
-
-						subs.Append(rn->GetNotes());
-						if (rn->GetNotesLength() && rn->GetNotes()[rn->GetNotesLength()-1] != '\n')
-							subs.Append("\n");
-						subs.Append("\n");
+  int iFiles = DragQueryFile(h, 0xFFFFFFFF, NULL, 0);
+  bool imported = false;
+  for (int i = 0; i < iFiles; i++) {
+    char fn[SNM_MAX_PATH] = "";
+    DragQueryFile(h, i, fn, sizeof(fn));
+    if (HasFileExtension(fn, "ASS")) {
+      if (ImportAssFile(fn)) imported = true;
+      lstrcpyn(g_lastImportSubFn, fn, sizeof(g_lastImportSubFn));
+    } else if (HasFileExtension(fn, "SRT")) {
+      if (ImportSubRipFile(fn)) imported = true;
+      lstrcpyn(g_lastImportSubFn, fn, sizeof(g_lastImportSubFn));
+    } else if (HasFileExtension(fn, "ROLES")) {
+      if (ImportRolesFile(fn)) {
+        lstrcpyn(g_lastRolesFn, fn, sizeof(g_lastRolesFn));
+        UpdateRegionColors();
+        RefreshActorList();
+        ForceUpdateRgnSub();
+        RefreshGUI();
+        MarkProjectDirty(NULL);
+      } else {
+        MessageBox(GetMainHwnd(),
+                   __LOCALIZE("Некорректный файл ролёвки!", "sws_DLG_152"),
+                   __LOCALIZE("ReNotes - Ошибка", "sws_DLG_152"),
+                   MB_OK);
+      }
+    } else {
+      MessageBox(GetMainHwnd(),
+                 __LOCALIZE("Некорректный файл субтитров!", "sws_DLG_152"),
+                 __LOCALIZE("ReNotes - Ошибка", "sws_DLG_152"),
+                 MB_OK);
 					}
 				}
+  if (imported) {
+    MarkProjectDirty(NULL);
+    RefreshActorList();
+  }
+  DragFinish(h);
+}
+
+bool ExportRolesFile(const char*fn) {
+  WDL_PtrList_DOD<SNM_Actor> *actors = g_actors.Get();
+
+  WDL_PtrList<SNM_Actor> merged;
+  for (int i = 0; i < actors->GetSize(); i++) {
+    SNM_Actor *a = actors->Get(i);
+    if (a->HasLinkedActor() || a->HasCustomColor())
+      merged.Add(a);
+  }
+  WDL_PtrList_DOD<SNM_Actor> *imported = g_importedRoleActors.Get();
+  for (int i = 0; i < imported->GetSize(); i++) {
+    SNM_Actor *ia = imported->Get(i);
+    bool found = false;
+    for (int j = 0; j < actors->GetSize(); j++)
+{
+	if (!strcmp(actors->Get(j)->GetName(), ia->GetName())) {
+        found = true;
+        break;
+      }
+    }
+    if (!found)
+      merged.Add(ia);
+  }
+
+  if (merged.GetSize() == 0)
+    return false;
+
+  FILE* f = fopenUTF8(fn, "w");
+				if (!f)
+    return false;
+
+  WDL_PtrList<const char> writtenLinked;
+  for (int i = 0; i < merged.GetSize(); i++) {
+    SNM_Actor *a = merged.Get(i);
+			if (!a->HasLinkedActor())
+      continue;
+    const char *linked = a->GetLinkedActorName();
+    bool alreadyWritten = false;
+    for (int j = 0; j < writtenLinked.GetSize(); j++) {
+      if (!strcmp(writtenLinked.Get(j), linked)) {
+        alreadyWritten = true;
+        break;
+      }
+    }
+    if (alreadyWritten)
+      continue;
+    writtenLinked.Add(linked);
+
+    fprintf(f, "[%s]\n", linked);
+    bool colorWritten = false;
+    for (int j = 0; j < merged.GetSize(); j++) {
+      SNM_Actor *b = merged.Get(j);
+      if (b->HasLinkedActor() && !strcmp(b->GetLinkedActorName(), linked)) {
+        if (!colorWritten && b->HasCustomColor()) {
+          int c = b->GetColor() & 0xFFFFFF;
+          int r = c & 0xFF, g = (c >> 8) & 0xFF, bl = (c >> 16) & 0xFF;
+          fprintf(f, "color = #%02X%02X%02X\n", r, g, bl);
+          colorWritten = true;
+        }
+        fprintf(f, "character = %s\n", b->GetName());
+      }
+    }
+    fprintf(f, "\n");
+  }
+
+  for (int i = 0; i < merged.GetSize(); i++) {
+    SNM_Actor *a = merged.Get(i);
+    if (!a->HasLinkedActor() && a->HasCustomColor()) {
+      int c = a->GetColor() & 0xFFFFFF;
+      int r = c & 0xFF, g = (c >> 8) & 0xFF, bl = (c >> 16) & 0xFF;
+      fprintf(f, "[character:%s]\n", a->GetName());
+      fprintf(f, "color = #%02X%02X%02X\n", r, g, bl);
+      fprintf(f, "\n");
 			}
 		}
 
-		if (subs.GetLength())
-		{
-			fputs(subs.Get(), f);
 			fclose(f);
 			return true;
 		}
+
+bool ImportRolesFile(const char *fn) {
+  FILE *f = fopenUTF8(fn, "rt");
+  if (!f)
+    return false;
+
+  enum { SECTION_NONE, SECTION_LINKED, SECTION_CHARACTER };
+  int sectionType = SECTION_NONE;
+  WDL_FastString sectionName;
+  int parsedColor = 0;
+  bool hasColor = false;
+  bool stateCleared = false;
+  WDL_PtrList_DOD<WDL_FastString> charNames;
+
+  auto applySection = [&]() {
+    if (sectionType == SECTION_LINKED)
+			{
+				for (int i=0; i < charNames.GetSize(); i++) {
+        const char *charName = charNames.Get(i)->Get();
+        SNM_Actor *a = FindOrCreateActor(charName);
+        a->SetLinkedActorName(sectionName.Get());
+        if (hasColor) {
+          a->SetColor(parsedColor);
+          a->SetHasCustomColor(true);
 	}
+        SNM_Actor *ia = new SNM_Actor(charName,
+                                      hasColor ? parsedColor : GenerateActorColor(charName));
+        ia->SetLinkedActorName(sectionName.Get());
+        if (hasColor) ia->SetHasCustomColor(true);
+        g_importedRoleActors.Get()->Add(ia);
+      }
+    } else if (sectionType == SECTION_CHARACTER) {
+      SNM_Actor *a = FindOrCreateActor(sectionName.Get());
+      if (hasColor) {
+        a->SetColor(parsedColor);
+        a->SetHasCustomColor(true);
+        SNM_Actor *ia = new SNM_Actor(sectionName.Get(), parsedColor);
+        ia->SetHasCustomColor(true);
+        g_importedRoleActors.Get()->Add(ia);
+      }
+    }
+  };
+
+  char buf[4096];
+  if (fgets(buf, 4, f) && strcmp("\xEF\xBB\xBF", buf))
+    rewind(f);
+
+  while (fgets(buf, sizeof(buf), f)) {
+    char *line = buf;
+    while (*line == ' ' || *line == '\t')
+      line++;
+    char *end = line + strlen(line);
+    while (end > line && (end[-1] == '\r' || end[-1] == '\n' || end[-1] == ' ' || end[-1] == '\t'))
+      end--;
+    *end = '\0';
+
+    if (!*line || *line == '#' || *line == ';')
+      continue;
+
+    if (*line == '[') {
+      if (!stateCleared) {
+        g_importedRoleActors.Get()->Empty(true);
+        WDL_PtrList_DOD<SNM_Actor> *actors = g_actors.Get();
+        for (int i = 0; i < actors->GetSize(); i++)
+				{
+          SNM_Actor *a = actors->Get(i);
+          a->SetLinkedActorName("");
+          a->SetHasCustomColor(false);
+          a->SetColor(GenerateActorColor(a->GetName()));
+        }
+        stateCleared = true;
+      }
+      applySection();
+
+      charNames.Empty(true);
+      hasColor = false;
+      parsedColor = 0;
+
+      char *closing = strrchr(line, ']');
+						if (!closing)
+        continue;
+      *closing = '\0';
+      const char *header = line + 1;
+
+      if (_strnicmp(header, "character:", 10) == 0) {
+        sectionType = SECTION_CHARACTER;
+        sectionName.Set(header + 10);
+      } else {
+        sectionType = SECTION_LINKED;
+        sectionName.Set(header);
+      }
+      continue;
+    }
+
+    if (sectionType == SECTION_NONE)
+      continue;
+
+    char *eq = strchr(line, '=');
+    if (!eq)
+      continue;
+
+    char *keyEnd = eq;
+    while (keyEnd > line && (keyEnd[-1] == ' ' || keyEnd[-1] == '\t'))
+      keyEnd--;
+    *keyEnd = '\0';
+
+    char *value = eq + 1;
+    while (*value == ' ' || *value == '\t')
+      value++;
+
+    if (_stricmp(line, "color") == 0 && *value == '#' && strlen(value) == 7) {
+      int r, g, b;
+      if (sscanf(value + 1, "%02x%02x%02x", &r, &g, &b) == 3) {
+        parsedColor = RGB(r, g, b) | 0x1000000;
+        hasColor = true;
+      }
+    } else if (_stricmp(line, "character") == 0 && *value) {
+      charNames.Add(new WDL_FastString(value));
+					}
+				}
+
+  if (!stateCleared)
+		{
+    fclose(f);
 	return false;
 }
 
-void ExportSubTitleFile(COMMAND_T* _ct)
+  applySection();
+			fclose(f);
+			return true;
+		}
+
+void ClearAllSubtitles()
 {
-	char fn[SNM_MAX_PATH] = "";
-	if (BrowseForSaveFile(__LOCALIZE("S&M - Export subtitle file","sws_DLG_152"), g_lastExportSubFn, strrchr(g_lastExportSubFn, '.') ? g_lastExportSubFn : NULL, SNM_SUB_EXT_LIST, fn, sizeof(fn))) {
-		lstrcpyn(g_lastExportSubFn, fn, sizeof(g_lastExportSubFn));
-		ExportSubRipFile(fn);
+  WDL_PtrList_DOD<SNM_RegionSubtitle> *subs = g_pRegionSubs.Get();
+  for (int i = subs->GetSize() - 1; i >= 0; i--) {
+    SNM_RegionSubtitle *sub = subs->Get(i);
+	if (sub && sub->IsValid()) {
+      int idx = GetMarkerRegionIndexFromId(NULL, sub->GetId());
+      if (idx >= 0)
+        DeleteProjectMarkerByIndex(NULL, idx);
 	}
+  }
+  subs->Empty(true);
+
+  g_actors.Get()->Empty(true);
+  g_importedRoleActors.Get()->Empty(true);
+
+  UpdateTimeline();
+  MarkProjectDirty(NULL);
 }
 
 void WriteGlobalNotesToFile()
 {
-	// write global notes to <REAPER resource path>/SWS_Global notes.txt
 	if (!g_globalNotesDirty) return;
 	
+	// Write global notes to <REAPER resource path>/SWS_Global ReNotes.txt.
 	WDL_FastString filePath;
-	filePath.SetFormatted(SNM_MAX_PATH, "%s/SWS_Global notes.txt", GetResourcePath());
-	WDL_FileWrite outfile(filePath.Get(), 1, 65536, 16, 16); // NF: not sure about these params, taken from 
+	filePath.SetFormatted(SNM_MAX_PATH, "%s/SWS_Global ReNotes.txt", GetResourcePath());
+	WDL_FileWrite outfile(filePath.Get(), 1, 65536, 16, 16); // NF: not sure about these params, taken from
 	//https://github.com/justinfrankel/licecap/blob/3721ce33ac72ff05ef89d2e92ca58a0f96164134/WDL/lice/lice_gif_write.cpp#L386
 	const int globalNotesLength = g_globalNotes.GetLength();
 	const int wrtPos = outfile.Write(g_globalNotes.Get(), globalNotesLength);
@@ -1466,7 +3232,7 @@ void WriteGlobalNotesToFile()
 	}
 	else // writing failed
 	{
-		MessageBox(GetMainHwnd(), __LOCALIZE("Saving global notes failed.", "sws_mbox"), __LOCALIZE("SWS - Error", "sws_mbox"), MB_OK);
+		MessageBox(GetMainHwnd(), __LOCALIZE("Не удалось сохранить глобальные заметки.", "sws_mbox"), __LOCALIZE("ReNotes - Ошибка", "sws_mbox"), MB_OK);
 	}
 }
 
@@ -1510,16 +3276,62 @@ static bool ProcessExtensionLine(const char *line, ProjectStateContext *ctx, boo
 	}
 	else if (!strcmp(lp.gettoken_str(0), "<S&M_SUBTITLE"))
 	{
-		if (GetMarkerRegionIndexFromId(p, lp.gettoken_int(1)) >= 0) // still exists?
-		{
+    int id = lp.gettoken_int(1);
+    bool isNewFormat = (lp.getnumtokens() >= 4);
+    double startTime = isNewFormat ? lp.gettoken_float(2) : 0.0;
+    double endTime = isNewFormat ? lp.gettoken_float(3) : 0.0;
+
 			WDL_FastString notes;
 			ExtensionConfigToString(&notes, ctx);
 
 			char buf[MAX_HELP_LENGTH] = "";
-			if (GetStringFromNotesChunk(&notes, buf, MAX_HELP_LENGTH))
-				g_pRegionSubs.Get()->Add(new SNM_RegionSubtitle(p, lp.gettoken_int(1), buf));
-			return true;
+    char actor[256] = "";
+
+    if (isNewFormat) {
+      const char *notesPtr = notes.Get();
+      const char *newlinePos = strchr(notesPtr, '\n');
+      if (newlinePos) {
+        int actorLen = (int) (newlinePos - notesPtr);
+        if (actorLen >= (int) sizeof(actor))
+          actorLen = (int) sizeof(actor) - 1;
+        if (actorLen > 0)
+          memcpy(actor, notesPtr, actorLen);
+        actor[actorLen] = 0;
 		}
+    } else {
+      strcpy(actor, "?");
+      FindOrCreateActor("?");
+    }
+
+    if (GetStringFromNotesChunk(&notes, buf, MAX_HELP_LENGTH)) {
+      SNM_RegionSubtitle *sub = new SNM_RegionSubtitle(p, id, buf);
+      sub->SetActor(actor);
+      if (isNewFormat)
+        sub->SetTimes(startTime, endTime);
+      g_pRegionSubs.Get()->Add(sub);
+    }
+    return true;
+  } else if (!strcmp(lp.gettoken_str(0), "<S&M_ACTOR")) {
+    bool enabled = (lp.gettoken_int(1) == 1);
+    int color = lp.gettoken_int(2);
+    bool hasCustomColor = (lp.gettoken_int(3) == 1);
+
+    char actorName[SNM_MAX_CHUNK_LINE_LENGTH] = "";
+    if (ctx->GetLine(actorName, sizeof(actorName)) >= 0 && actorName[0] && strcmp(actorName, ">") !=
+      0) {
+      SNM_Actor *actor = new SNM_Actor(actorName, color);
+      actor->SetEnabled(enabled);
+      actor->SetHasCustomColor(hasCustomColor);
+
+      char nextLine[SNM_MAX_CHUNK_LINE_LENGTH] = "";
+      if (ctx->GetLine(nextLine, sizeof(nextLine)) >= 0 && strcmp(nextLine, ">") != 0) {
+        actor->SetLinkedActorName(nextLine);
+        ctx->GetLine(nextLine, sizeof(nextLine));
+      }
+
+      g_actors.Get()->Add(actor);
+    }
+    return true;
 	}
 	return false;
 }
@@ -1568,15 +3380,35 @@ static void SaveExtensionConfig(ProjectStateContext *ctx, bool isUndo, struct pr
 	{
 		if (SNM_RegionSubtitle* sub = g_pRegionSubs.Get()->Get(i))
 		{
-			if (sub->GetNotesLength() && sub->IsValid())
-			{
-				if (snprintfStrict(line, sizeof(line), "<S&M_SUBTITLE %d\n|", sub->GetId()) > 0)
+			if (!sub->GetNotesLength())
+        continue;
+      double startTime = sub->GetStartTime();
+      double endTime = sub->GetEndTime();
+      if (sub->IsValid())
+        EnumMarkerRegionById(NULL, sub->GetId(), NULL, &startTime, &endTime, NULL, NULL, NULL);
+      if (snprintfStrict(line, sizeof(line),
+                         "<S&M_SUBTITLE %d %.6f %.6f\n%s\n|", sub->GetId(),
+                         startTime,
+                         endTime,
+                         sub->GetActor()) > 0)
 					if (GetNotesChunkFromString(sub->GetNotes(), &formatedNotes, line))
 						StringToExtensionConfig(&formatedNotes, ctx);
 			}
-			else
-			{
-				g_pRegionSubs.Get()->Delete(i--, true);
+  }
+
+  for (int i = 0; i < g_actors.Get()->GetSize(); i++) {
+    if (SNM_Actor *actor = g_actors.Get()->Get(i)) {
+      if (snprintfStrict(line,
+                         sizeof(line),
+                         "<S&M_ACTOR %d %d %d",
+                         actor->IsEnabled() ? 1 : 0,
+                         actor->GetColor(),
+                         actor->HasCustomColor() ? 1 : 0) > 0) {
+        ctx->AddLine("%s", line);
+        ctx->AddLine("%s", actor->GetName());
+        if (actor->HasLinkedActor())
+          ctx->AddLine("%s", actor->GetLinkedActorName());
+        ctx->AddLine(">");
 			}
 		}
 	}
@@ -1584,6 +3416,7 @@ static void SaveExtensionConfig(ProjectStateContext *ctx, bool isUndo, struct pr
 
 static void BeginLoadProjectState(bool isUndo, struct project_config_extension_t *reg)
 {
+  g_pendingRegionRecreation = !isUndo;
 	g_prjNotes.Cleanup();
 	g_prjNotes.Get()->Set("");
 
@@ -1592,6 +3425,11 @@ static void BeginLoadProjectState(bool isUndo, struct project_config_extension_t
 
 	g_pRegionSubs.Cleanup();
 	g_pRegionSubs.Get()->Empty(true);
+
+  g_actors.Cleanup();
+  g_actors.Get()->Empty(true);
+  g_importedRoleActors.Cleanup();
+  g_importedRoleActors.Get()->Empty(true);
 
 	// g_globalNotes is loaded in NotesInit()
 }
@@ -1622,27 +3460,32 @@ void NotesSetTrackListChange() {
 int NotesInit()
 {
 	lstrcpyn(g_lastImportSubFn, GetResourcePath(), sizeof(g_lastImportSubFn));
-	lstrcpyn(g_lastExportSubFn, GetResourcePath(), sizeof(g_lastExportSubFn));
+	lstrcpyn(g_lastRolesFn, GetResourcePath(), sizeof(g_lastRolesFn));
 
 	// load prefs 
-	g_notesType = GetPrivateProfileInt(NOTES_INI_SEC, "Type", 0, g_SNM_IniFn.Get());
-	g_locked = (GetPrivateProfileInt(NOTES_INI_SEC, "Lock", 0, g_SNM_IniFn.Get()) == 1);
+	g_notesType = GetPrivateProfileInt(NOTES_INI_SEC, "Type", SNM_NOTES_RGN_SUB, g_SNM_IniFn.Get());
+	g_locked = (GetPrivateProfileInt(NOTES_INI_SEC, "Lock", 1, g_SNM_IniFn.Get()) == 1);
 	GetPrivateProfileString(NOTES_INI_SEC, "BigFontName", SNM_DYN_FONT_NAME, g_notesBigFontName, sizeof(g_notesBigFontName), g_SNM_IniFn.Get());
 	g_wrapText=(GetPrivateProfileInt(NOTES_INI_SEC, "WrapText", 0, g_SNM_IniFn.Get()) == 1);
+  g_coloredRegions = (GetPrivateProfileInt(NOTES_INI_SEC, "ColoredRegions", 1, g_SNM_IniFn.Get()) ==
+    1);
+  g_displayActorInPrefix =
+      (GetPrivateProfileInt(NOTES_INI_SEC, "DisplayActorInPrefix", 1, g_SNM_IniFn.Get()) == 1);
+  g_hideRegions = (GetPrivateProfileInt(NOTES_INI_SEC, "HideRegions", 0, g_SNM_IniFn.Get()) == 1);
+  g_hideActorList = (GetPrivateProfileInt(NOTES_INI_SEC, "HideActorList", 0, g_SNM_IniFn.Get()) == 1);
 
-	// get the action help filename
-	char defaultHelpFn[SNM_MAX_PATH] = "";
-	if (snprintfStrict(defaultHelpFn, sizeof(defaultHelpFn), SNM_ACTION_HELP_INI_FILE, GetResourcePath()) <= 0)
-		*defaultHelpFn = '\0';
-	GetPrivateProfileString(NOTES_INI_SEC, "Action_help_file", defaultHelpFn, g_actionHelpFn, sizeof(g_actionHelpFn), g_SNM_IniFn.Get());
-
-	// read global notes from <REAPER resource path>/SWS_Global notes.txt
+	// Read global notes from the ReNotes file, falling back to the legacy SWS filename.
 	WDL_FastString filePath;
+	filePath.SetFormatted(SNM_MAX_PATH, "%s/SWS_Global ReNotes.txt", GetResourcePath());
+	WDL_FileRead infile(filePath.Get(), 0, 65536);
+  int infileSize = static_cast<int>(infile.GetSize());
+  if (infileSize < 0) {
 	filePath.SetFormatted(SNM_MAX_PATH, "%s/SWS_Global notes.txt", GetResourcePath());
-	WDL_FileRead infile(filePath.Get(), 0, 65536); // NF: not sure about these params, taken from
-	//https://github.com/justinfrankel/licecap/blob/3721ce33ac72ff05ef89d2e92ca58a0f96164134/WDL/lice/lice_gif.cpp#L130
-	const int infileSize = static_cast<int>(infile.GetSize());
+    WDL_FileRead oldFile(filePath.Get(), 0, 65536);
+    infileSize = static_cast<int>(oldFile.GetSize());
 	if(infileSize >= 0 && g_globalNotes.SetLen(infileSize, true))
+      oldFile.Read(const_cast<char *>(g_globalNotes.Get()), infileSize);
+  } else if(infileSize >= 0 && g_globalNotes.SetLen(infileSize, true))
 		infile.Read(const_cast<char *>(g_globalNotes.Get()), infileSize);
 	
 	// instanciate the window if needed, can be NULL
@@ -1664,11 +3507,21 @@ void NotesExit()
 	WritePrivateProfileString(NOTES_INI_SEC, "Lock", g_locked?"1":"0", g_SNM_IniFn.Get()); 
 	WritePrivateProfileString(NOTES_INI_SEC, "BigFontName", g_notesBigFontName, g_SNM_IniFn.Get());
 	WritePrivateProfileString(NOTES_INI_SEC, "WrapText", g_wrapText?"1":"0", g_SNM_IniFn.Get());
-
-	// save the action help filename
-	WDL_FastString escapedStr;
-	escapedStr.SetFormatted(SNM_MAX_PATH, "\"%s\"", g_actionHelpFn);
-	WritePrivateProfileString(NOTES_INI_SEC, "Action_help_file", escapedStr.Get(), g_SNM_IniFn.Get());
+  WritePrivateProfileString(NOTES_INI_SEC,
+                            "ColoredRegions",
+                            g_coloredRegions ? "1" : "0",
+                            g_SNM_IniFn.Get());
+	WritePrivateProfileString(NOTES_INI_SEC,
+                            "DisplayActorInPrefix",
+                            g_displayActorInPrefix ? "1" : "0",
+                            g_SNM_IniFn.Get());
+  WritePrivateProfileString(NOTES_INI_SEC,
+                            "HideRegions",
+                            g_hideRegions ? "1" : "0",
+                            g_SNM_IniFn.Get());
+  WritePrivateProfileString(NOTES_INI_SEC,
+                            "HideActorList",
+                            g_hideActorList ? "1" : "0", g_SNM_IniFn.Get());
 
 	g_notesWndMgr.Delete();
 }
@@ -1704,6 +3557,232 @@ void ToggleNotesLock(COMMAND_T*) {
 
 int IsNotesLocked(COMMAND_T*) {
 	return g_locked;
+}
+
+void ToggleColoredRegions(COMMAND_T *) {
+  g_coloredRegions = !g_coloredRegions;
+  UpdateRegionColors();
+  if (NotesWnd *w = g_notesWndMgr.Get())
+    w->RefreshGUI();
+}
+
+int IsColoredRegions(COMMAND_T *) {
+  return g_coloredRegions;
+}
+
+void HideAllRegions() {
+  WDL_PtrList_DOD<SNM_RegionSubtitle> *subs = g_pRegionSubs.Get();
+  PreventUIRefresh(1);
+  for (int i = 0; i < subs->GetSize(); i++) {
+    SNM_RegionSubtitle *sub = subs->Get(i);
+    if (sub->IsValid()) {
+      double pos, endPos;
+      if (EnumMarkerRegionById(NULL, sub->GetId(), NULL, &pos, &endPos, NULL, NULL, NULL) >= 0)
+        sub->SetTimes(pos, endPos);
+      int idx = GetMarkerRegionIndexFromId(NULL, sub->GetId());
+      if (idx >= 0)
+        DeleteProjectMarkerByIndex(NULL, idx);
+      sub->SetId(-1);
+    }
+  }
+  PreventUIRefresh(-1);
+}
+
+void ShowAllRegions() {
+  WDL_PtrList_DOD<SNM_Actor> *actors = g_actors.Get();
+  PreventUIRefresh(1);
+  for (int i = 0; i < actors->GetSize(); i++) {
+    if (actors->Get(i)->IsEnabled())
+      RecreateActorRegions(actors->Get(i)->GetName());
+  }
+  PreventUIRefresh(-1);
+}
+
+void ToggleHideRegions(COMMAND_T *) {
+  g_hideRegions = !g_hideRegions;
+  if (g_hideRegions)
+    HideAllRegions();
+  else
+    ShowAllRegions();
+  g_lastMarkerPos = -1.0;
+  UpdateTimeline();
+  if (NotesWnd *w = g_notesWndMgr.Get())
+    w->RefreshGUI();
+}
+
+void ToggleHideActorList(COMMAND_T *) {
+  g_hideActorList = !g_hideActorList;
+  if (NotesWnd *w = g_notesWndMgr.Get()) {
+    HWND hwnd = w->GetHWND();
+    RECT r;
+    GetClientRect(hwnd, &r);
+    SendMessage(hwnd, WM_SIZE, SIZE_RESTORED, MAKELPARAM(r.right, r.bottom));
+  }
+}
+
+void ToggleDisplayActorInPrefix(COMMAND_T *) {
+  g_displayActorInPrefix = !g_displayActorInPrefix;
+  UpdateRegionColors();
+  if (NotesWnd *w = g_notesWndMgr.Get()) {
+    w->ForceUpdateRgnSub();
+    w->RefreshGUI();
+  }
+}
+
+int IsHideRegions(COMMAND_T *) {
+  return g_hideRegions;
+}
+
+int IsHideActorList(COMMAND_T *) {
+  return g_hideActorList;
+}
+
+int IsDisplayActorInPrefix(COMMAND_T *) {
+  return g_displayActorInPrefix;
+}
+
+void CopyMarkersAction(COMMAND_T *) {
+  CopyMarkersToClipboard(GetMainHwnd());
+}
+
+void CopyRoleDistributionAction(COMMAND_T *) {
+  WDL_PtrList_DOD<SNM_Actor> *actors = g_actors.Get();
+  WDL_PtrList_DOD<WDL_FastString> linkedNames;
+  WDL_PtrList_DOD<WDL_FastString> charLists;
+  for (int i = 0; i < actors->GetSize(); i++) {
+    SNM_Actor *a = actors->Get(i);
+    if (!a->HasLinkedActor()) continue;
+    const char *linked = a->GetLinkedActorName();
+    int idx = -1;
+    for (int j = 0; j < linkedNames.GetSize(); j++) {
+      if (!strcmp(linkedNames.Get(j)->Get(), linked)) {
+        idx = j;
+        break;
+      }
+    }
+    if (idx < 0) {
+      linkedNames.Add(new WDL_FastString(linked));
+      charLists.Add(new WDL_FastString());
+      idx = linkedNames.GetSize() - 1;
+    }
+    charLists.Get(idx)->AppendFormatted(512, "- %s\n", a->GetName());
+  }
+  if (!linkedNames.GetSize()) {
+    MessageBox(GetMainHwnd(),
+               __LOCALIZE("Нет привязанных актёров.", "sws_DLG_152"),
+               __LOCALIZE("ReNotes", "sws_DLG_152"),
+               MB_OK);
+    return;
+  }
+  WDL_FastString output;
+  for (int i = 0; i < linkedNames.GetSize(); i++) {
+    if (i > 0) output.Append("\n");
+    output.AppendFormatted(512, "%s:\n", linkedNames.Get(i)->Get());
+    output.Append(charLists.Get(i)->Get());
+  }
+  if (output.GetLength() > 0 && output.Get()[output.GetLength() - 1] == '\n')
+    output.DeleteSub(output.GetLength() - 1, 1);
+  CF_SetClipboard(output.Get());
+}
+
+void ClearAllSubtitlesAction(COMMAND_T *) {
+  ClearAllSubtitles();
+  if (NotesWnd *w = g_notesWndMgr.Get()) {
+    w->RefreshActorList();
+    w->Update(true);
+  }
+}
+
+void EnableAllActors(COMMAND_T *) {
+  WDL_PtrList_DOD<SNM_Actor> *actors = g_actors.Get();
+  for (int i = 0; i < actors->GetSize(); i++) {
+    SNM_Actor *actor = actors->Get(i);
+    if (!actor->IsEnabled()) {
+      actor->SetEnabled(true);
+      RecreateActorRegions(actor->GetName());
+    }
+  }
+  if (g_hideRegions)
+    g_lastMarkerPos = -1.0;
+  if (NotesWnd *w = g_notesWndMgr.Get())
+    w->RefreshActorList();
+}
+
+void DisableAllActors(COMMAND_T *) {
+  WDL_PtrList_DOD<SNM_Actor> *actors = g_actors.Get();
+  for (int i = 0; i < actors->GetSize(); i++) {
+    SNM_Actor *actor = actors->Get(i);
+    if (actor->IsEnabled()) {
+      actor->SetEnabled(false);
+      DeleteActorRegions(actor->GetName());
+    }
+  }
+  UpdateTimeline();
+  if (g_hideRegions)
+    g_lastMarkerPos = -1.0;
+  if (NotesWnd *w = g_notesWndMgr.Get())
+    w->RefreshActorList();
+}
+
+void ImportRolesAction(COMMAND_T *) {
+  if (char *fn = BrowseForFiles(
+    __LOCALIZE("ReNotes - Импорт ролёвки", "sws_DLG_152"),
+    g_lastRolesFn,
+    NULL,
+    false,
+    SNM_ROLES_EXT_LIST)) {
+    lstrcpyn(g_lastRolesFn, fn, sizeof(g_lastRolesFn));
+    if (ImportRolesFile(fn)) {
+      UpdateRegionColors();
+      if (NotesWnd *w = g_notesWndMgr.Get()) {
+        w->RefreshActorList();
+        w->ForceUpdateRgnSub();
+        w->RefreshGUI();
+      }
+      MarkProjectDirty(NULL);
+    } else
+      MessageBox(GetMainHwnd(),
+                 __LOCALIZE("Некорректный файл ролёвки!", "sws_DLG_152"),
+                 __LOCALIZE("ReNotes - Ошибка", "sws_DLG_152"),
+                 MB_OK);
+    free(fn);
+  }
+}
+
+void ExportRolesAction(COMMAND_T *) {
+  WDL_PtrList_DOD<SNM_Actor> *actors = g_actors.Get();
+  bool hasData = false;
+  for (int i = 0; i < actors->GetSize(); i++) {
+    SNM_Actor *a = actors->Get(i);
+    if (a->HasLinkedActor() || a->HasCustomColor()) {
+      hasData = true;
+      break;
+    }
+  }
+  if (!hasData && g_importedRoleActors.Get()->GetSize() > 0)
+    hasData = true;
+  if (!hasData) {
+    MessageBox(GetMainHwnd(),
+               __LOCALIZE("Ничего не найдено для экспорта.", "sws_DLG_152"),
+               __LOCALIZE("ReNotes", "sws_DLG_152"),
+               MB_OK);
+    return;
+  }
+  char fn[SNM_MAX_PATH] = "";
+  if (BrowseForSaveFile(
+    __LOCALIZE("ReNotes - Экспорт ролёвки", "sws_DLG_152"),
+    g_lastRolesFn,
+    NULL,
+    SNM_ROLES_EXT_LIST,
+    fn,
+    sizeof(fn))) {
+    lstrcpyn(g_lastRolesFn, fn, sizeof(g_lastRolesFn));
+    if (!ExportRolesFile(fn))
+      MessageBox(GetMainHwnd(),
+                 __LOCALIZE("Не удалось экспортировать ролёвку.", "sws_DLG_152"),
+                 __LOCALIZE("ReNotes - Ошибка", "sws_DLG_152"),
+                 MB_OK);
+  }
 }
 
 /******************************************************************************
@@ -1813,8 +3892,8 @@ bool NFDoSetSWSMarkerRegionSub(const char* mkrRgnSubIn, int mkrRgnIdxNumberIn)
 void NF_DoUpdateSWSMarkerRegionSubWindow()
 {
 	if (NotesWnd* w = g_notesWndMgr.Get()) {
-		if (w->IsWndVisible() && g_notesType <= SNM_NOTES_MKRRGN_SUB && g_notesType >= SNM_NOTES_MKR_SUB)
-			w->ForceUpdateMkrRgnNameOrSub(g_notesType);
+		if (w->IsWndVisible() && g_notesType == SNM_NOTES_RGN_SUB)
+			w->ForceUpdateRgnSub();
 	}
 }
 

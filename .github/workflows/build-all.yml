@@ -1,0 +1,111 @@
+name: Build and Release
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  metadata:
+    runs-on: ubuntu-24.04
+    outputs:
+      renotes_version: ${{ steps.version.outputs.renotes_version }}
+      tag: ${{ steps.version.outputs.tag }}
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Read version
+        id: version
+        shell: bash
+        run: |
+          version=$(sed -nE 's/^#define RENOTES_VERSION ([0-9]+)$/\1/p' version.h.in)
+          if [[ ! "$version" =~ ^[0-9]+$ ]]; then
+            echo "::error::Invalid RENOTES_VERSION"
+            exit 1
+          fi
+
+          tag="renotes-v$version"
+          set +e
+          git ls-remote --exit-code --tags origin "refs/tags/$tag" > /dev/null
+          status=$?
+          set -e
+          if [ "$status" -eq 0 ]; then
+            echo "::error::Tag $tag already exists"
+            exit 1
+          elif [ "$status" -ne 2 ]; then
+            echo "::error::Unable to check tag $tag"
+            exit "$status"
+          fi
+
+          echo "renotes_version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+  build-linux:
+    needs: metadata
+    uses: ./.github/workflows/build-linux.yml
+
+  build-macos:
+    needs: metadata
+    strategy:
+      matrix:
+        arch: [arm64, x86_64]
+    uses: ./.github/workflows/build-macos.yml
+    with:
+      arch: ${{ matrix.arch }}
+
+  build-windows:
+    needs: metadata
+    uses: ./.github/workflows/build-windows.yml
+
+  release:
+    needs: [metadata, build-linux, build-macos, build-windows]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download packages
+        uses: actions/download-artifact@v8
+        with:
+          pattern: release-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Validate packages
+        shell: bash
+        run: |
+          version="${{ needs.metadata.outputs.renotes_version }}"
+          shopt -s nullglob
+          assets=(release-assets/*)
+          linux=(release-assets/sws-*-renotes-v"$version"-Linux-x86_64-*.tar.xz)
+          macos_arm=(release-assets/sws-*-renotes-v"$version"-Darwin-arm64-*.dmg)
+          macos_intel=(release-assets/sws-*-renotes-v"$version"-Darwin-x86_64-*.dmg)
+          windows=(release-assets/sws-*-renotes-v"$version"-Windows-x64-*.exe)
+
+          if [ "${#assets[@]}" -ne 4 ] || [ "${#linux[@]}" -ne 1 ] || \
+             [ "${#macos_arm[@]}" -ne 1 ] || [ "${#macos_intel[@]}" -ne 1 ] || \
+             [ "${#windows[@]}" -ne 1 ]; then
+            echo "::error::Unexpected release packages"
+            printf '%s\n' "${assets[@]}" >&2
+            exit 1
+          fi
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release create "${{ needs.metadata.outputs.tag }}" release-assets/* \
+            --target "$GITHUB_SHA" \
+            --title "ReNotes v${{ needs.metadata.outputs.renotes_version }}" \
+            --notes ""

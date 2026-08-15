@@ -1,4 +1,9 @@
-if(TARGET z)
+if(TARGET ZLIB::ZLIB)
+  return()
+endif()
+
+if(APPLE)
+  include("${CMAKE_ROOT}/Modules/FindZLIB.cmake")
   return()
 endif()
 

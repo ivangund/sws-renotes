@@ -151,7 +151,8 @@ INT_PTR SWS_DockWnd::WndProc(UINT uMsg, WPARAM wParam, LPARAM lParam)
 		// theme list views
 		for (int i=0; i < m_pLists.GetSize(); i++)
 			if (SWS_ListView* lv = m_pLists.Get(i))
-				if (ListView_HookThemeColorsMessage(m_hwnd, uMsg, lParam, lv->GetOldColors(), GetWindowLong(lv->GetHWND(),GWL_ID), 0, lv->HideGridLines() ? 0 :lv->GetColumnCount()))
+				if (ListView_HookThemeColorsMessage(m_hwnd, uMsg, lParam, lv->GetOldColors(), GetWindowLong(lv->GetHWND(),GWL_ID), 0, lv->HideGridLines() ? 0 :lv->GetColumnCount(),
+                                            lv))
 					return 1;
 		// theme other ctrls
 		if (INT_PTR r = SNM_HookThemeColorsMessage(m_hwnd, uMsg, wParam, lParam, false))
@@ -1769,7 +1770,8 @@ void DrawListCustomGridLines(HWND hwnd, HDC hdc, RECT br, int color, int ncol)
 }
 #endif
 
-bool ListView_HookThemeColorsMessage(HWND hwndDlg, int uMsg, LPARAM lParam, int cstate[LISTVIEW_COLORHOOK_STATESIZE], int listID, int whichTheme, int wantGridForColumns)
+bool ListView_HookThemeColorsMessage(HWND hwndDlg, int uMsg, LPARAM lParam, int cstate[LISTVIEW_COLORHOOK_STATESIZE], int listID, int whichTheme, int wantGridForColumns,
+                                     SWS_ListView *listView)
 {
 //JFB added --->
   int sz;
@@ -1915,10 +1917,28 @@ bool ListView_HookThemeColorsMessage(HWND hwndDlg, int uMsg, LPARAM lParam, int 
 */
 					  lplvcd->nmcd.uItemState &= ~CDIS_FOCUS;
 					}
-					SetWindowLongPtr(hwndDlg,DWLP_MSGRESULT,0);
+					SetWindowLongPtr(hwndDlg,DWLP_MSGRESULT, CDRF_NOTIFYSUBITEMDRAW);
 					return true;
 				  }
 				break;
+                  case CDDS_SUBITEM | CDDS_ITEMPREPAINT:
+                    if (listView) {
+                      int s = ListView_GetItemState(hdr->hwndFrom,
+                                                    (int) lplvcd->nmcd.dwItemSpec,
+                                                    LVIS_SELECTED);
+                      SWS_ListItem *item = listView->GetListItem((int) lplvcd->nmcd.dwItemSpec);
+                      int iCol = listView->DisplayToDataCol(lplvcd->iSubItem);
+                      if (item && listView->CustomDrawItem(lplvcd->nmcd.hdc,
+                                                           item,
+                                                           iCol,
+                                                           &lplvcd->nmcd.rc,
+                                                           (s & LVIS_SELECTED) != 0)) {
+                        SetWindowLongPtr(hwndDlg, DWLP_MSGRESULT, CDRF_SKIPDEFAULT);
+                        return true;
+                      }
+                    }
+                    SetWindowLongPtr(hwndDlg, DWLP_MSGRESULT, 0);
+                    return true;
 				case CDDS_POSTPAINT:
 				  if (wantGridForColumns)
 				  {
@@ -1936,6 +1956,25 @@ bool ListView_HookThemeColorsMessage(HWND hwndDlg, int uMsg, LPARAM lParam, int 
 		  break;
 		}
 	  }
+#endif
+#ifndef _WIN32
+    case WM_NOTIFY:
+      if (lParam && listView) {
+        NMHDR *hdr = (NMHDR *) lParam;
+        if (hdr->idFrom == listID && hdr->code == NM_CUSTOMDRAW) {
+          LPNMLVCUSTOMDRAW lplvcd = (LPNMLVCUSTOMDRAW) lParam;
+          if (lplvcd->nmcd.dwDrawStage == CDDS_ITEMPREPAINT) {
+            SWS_ListItem *item = listView->GetListItem((int) lplvcd->nmcd.dwItemSpec);
+            int iCol = listView->DisplayToDataCol(lplvcd->iSubItem);
+            COLORREF textColor;
+            if (item && listView->GetCustomColumnColor(item, iCol, false, &textColor)) {
+              lplvcd->clrText = textColor;
+              return true;
+            }
+          }
+        }
+      }
+      break;
 #endif
   }
   return false;

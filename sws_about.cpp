@@ -60,14 +60,15 @@ INT_PTR WINAPI doAbout(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lParam)
 			char cVersion[256];
 			snprintf(cVersion, sizeof(cVersion),
 #ifdef GIT_BRANCH
-					"%s %d.%d.%d.%d %s (%s)",
+				"%s %d.%d.%d.%d %s (%s) (ReNotes v%d)",
 #else
-					"%s %d.%d.%d.%d %s",
+				"%s %d.%d.%d.%d %s (ReNotes v%d)",
 #endif
 				__LOCALIZE("Version","sws_DLG_109"), SWS_VERSION, GIT_COMMIT
 #ifdef GIT_BRANCH
 				, GIT_BRANCH
 #endif
+				, RENOTES_VERSION
 			);
 			char *p=strstr(cVersion, " #0");
 			if (p) *p=0;
@@ -215,6 +216,5 @@ void PackageInit()
 	if ((s_isPackaged = IsFromReaPack()))
 		return;
 
-	SWSRegisterCommands(g_legacyInstallCmds);
-	VersionCheckInitExit(true);
+  s_isPackaged = true;
 }

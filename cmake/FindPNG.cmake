@@ -30,6 +30,10 @@ add_library(png
 
 target_include_directories(png INTERFACE ${PNG_INCLUDE_DIR})
 
+if(APPLE)
+  target_compile_options(png PRIVATE -include math.h)
+endif()
+
 find_package(ZLIB REQUIRED)
 target_link_libraries(png PUBLIC ZLIB::ZLIB)
 

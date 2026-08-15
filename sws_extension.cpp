@@ -639,7 +639,10 @@ int WDL_STYLE_GetSysColor(int i)
 	return col;
 }
 int WDL_STYLE_WantGlobalButtonBorders() { return 0; }
-bool WDL_STYLE_WantGlobalButtonBackground(int *col) { return false; }
+bool WDL_STYLE_WantGlobalButtonBackground(int *col) {
+  if (col)
+    *col = GSC_mainwnd(COLOR_BTNFACE);
+  return true; }
 void WDL_STYLE_ScaleImageCoords(int *x, int *y) { }
 
 

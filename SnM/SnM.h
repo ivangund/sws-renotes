@@ -73,7 +73,6 @@
 
 #define SNM_FORMATED_INI_FILE      "%s\\S&M.ini"
 #define SNM_OLD_FORMATED_INI_FILE  "%s\\Plugins\\S&M.ini"
-#define SNM_ACTION_HELP_INI_FILE   "%s\\S&M_Action_help_en.ini"
 #define SNM_CYCLACTION_INI_FILE    "%s\\S&M_Cyclactions.ini"
 #define SNM_CYCLACTION_BAK_FILE    "%s\\S&M_Cyclactions.bak"
 #define SNM_CYCLACTION_EXPORT_FILE "%s\\S&M_Cyclactions_export.ini"
@@ -92,7 +91,6 @@
 
 #define SNM_FORMATED_INI_FILE      "%s/S&M.ini"
 #define SNM_OLD_FORMATED_INI_FILE  "%s/Plugins/S&M.ini"
-#define SNM_ACTION_HELP_INI_FILE   "%s/S&M_Action_help_en.ini"
 #define SNM_CYCLACTION_INI_FILE    "%s/S&M_Cyclactions.ini"
 #define SNM_CYCLACTION_BAK_FILE    "%s/S&M_Cyclactions.bak"
 #define SNM_CYCLACTION_EXPORT_FILE "%s/S&M_Cyclactions_export.ini"
@@ -125,7 +123,8 @@
 #define SNM_CSURF_EXT_UNREGISTER   0x00016666
 #define SNM_REAPER_IMG_EXTS        "png,pcx,jpg,jpeg,jfif,ico,bmp" // img exts supported by REAPER (v4.32), can't get those at runtime yet
 #define SNM_INI_EXT_LIST           "INI files (*.INI)\0*.INI\0All Files\0*.*\0"
-#define SNM_SUB_EXT_LIST           "SubRip subtitle files (*.SRT)\0*.SRT\0"
+#define SNM_SUB_EXT_LIST           "Subtitle files (*.SRT;*.ASS)\0*.SRT;*.ASS\0SubRip (*.SRT)\0*.SRT\0Advanced SubStation Alpha (*.ASS)\0*.ASS\0"
+#define SNM_ROLES_EXT_LIST         "Ролёвка ReNotes (*.roles)\0*.roles\0"
 #define SNM_TXT_EXT_LIST           "Text files (*.txt)\0*.txt\0All files (*.*)\0*.*\0"
 
 #define SNM_MARKER_MASK            1

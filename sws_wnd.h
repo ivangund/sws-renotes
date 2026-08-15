@@ -106,7 +106,14 @@ public:
 	bool UpdatesDisabled() { return m_bDisableUpdates; }
 	HWND GetHWND() { return m_hwndList; }
 	HWND GetEditHWND() { return m_hwndEdit; }
-	virtual bool HideGridLines() {return false;}
+	virtual bool HideGridLines() { return false; }
+    virtual bool CustomDrawItem(HDC hdc, SWS_ListItem *item, int iCol, RECT *r, bool selected) {
+      return false;
+    }
+    virtual bool GetCustomColumnColor(SWS_ListItem *item,
+                                      int iCol,
+                                      bool selected,
+                                      COLORREF *textColor) {return false;}
 
 protected:
 	void EditListItem(int iIndex, int iCol);
@@ -255,5 +262,6 @@ char* SWS_LoadDockWndStateBuf(const char* _id, int _len = -1);
 int SWS_GetDockWndState(const char* _id, const char* _stateBuf = NULL);
 void SWS_SetDockWndState(const char* _stateBuf, int _len, SWS_DockWnd_State* _stateOut);
 
-bool ListView_HookThemeColorsMessage(HWND hwndDlg, int uMsg, LPARAM lParam, int cstate[LISTVIEW_COLORHOOK_STATESIZE], int listID, int whichTheme, int wantGridForColumns);
+bool ListView_HookThemeColorsMessage(HWND hwndDlg, int uMsg, LPARAM lParam, int cstate[LISTVIEW_COLORHOOK_STATESIZE], int listID, int whichTheme, int wantGridForColumns,
+                                     SWS_ListView *listView = nullptr);
 void DrawTooltipForPoint(LICE_IBitmap *bm, POINT mousePt, RECT *wndr, const char *text);
