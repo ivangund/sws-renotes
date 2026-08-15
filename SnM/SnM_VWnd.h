@@ -41,7 +41,12 @@ class SNM_VirtualComboBox : public WDL_VirtualComboBox
 public:
 	SNM_VirtualComboBox() : WDL_VirtualComboBox() {}
 	virtual ~SNM_VirtualComboBox() {}
-	int GetCurSel2()
+    virtual void OnPaint(LICE_IBitmap *drawbm,
+                         int origin_x,
+                         int origin_y,
+                         RECT *cliprect,
+                         int rscale);
+    int GetCurSel2()
 	{
 		int sel = WDL_VirtualComboBox::GetCurSel();
 		for (int i=sel; i>=0; i--)
@@ -66,7 +71,8 @@ public:
 		m_fontName.Set("Arial"); // very default font, ok on osx/win..
 		m_alpha=255;
 		m_col=0;
-		m_maxLineIdx=m_lastFontH=-1; 
+		m_maxLineIdx=m_lastFontH=-1;
+      m_lastW = m_lastH = 0;
 		m_wantBorder=false;
 		m_wantTitleLane=true;
 		m_align=m_titleAlign=DT_CENTER;
@@ -83,15 +89,19 @@ public:
 	virtual bool HasTitleLane();
 	virtual bool WantTitleLane() { return m_wantTitleLane; }
 	virtual void SetWantTitleLane(bool _want) { m_wantTitleLane=_want; }
+    virtual void ClearActorColors() { m_actorColors.DeleteAll(); }
+    virtual void AddActorColor(const char *name, int color);
 
-protected:
+  protected:
 	virtual int GetTitleLaneHeight();
-	void DrawLines(LICE_IBitmap* _drawbm, RECT* _r, int _fontHeight);
+	void DrawLines(LICE_IBitmap* _drawbm, RECT* _r, int _fontHeight, int _defaultCol);
 
 	LICE_CachedFont m_font;
 	WDL_FastString m_title, m_fontName, m_lastText;
 	WDL_PtrList_DeleteOnDestroy<WDL_FastString> m_lines;
-	int m_maxLineIdx, m_lastFontH, m_col;
+    WDL_StringKeyedArray<int> m_actorColors;
+    int m_maxLineIdx, m_lastFontH, m_col;
+    int m_lastW, m_lastH;
 	bool m_wantBorder, m_wantTitleLane;
 	unsigned char m_alpha;
 	UINT m_align, m_titleAlign;
@@ -195,6 +205,11 @@ public:
 	virtual const char *GetType() { return "SNM_ToolbarButton"; }
 	virtual char GetPressed() { return m_pressed; }
 	virtual void SetGrayed(bool _grayed);
+    virtual void OnPaint(LICE_IBitmap *drawbm,
+                         int origin_x,
+                         int origin_y,
+                         RECT *cliprect,
+                         int rscale);
 };
 
 class SNM_Knob : public WDL_VirtualSlider {

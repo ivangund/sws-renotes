@@ -92,6 +92,7 @@
 #define IDC_MISC_SPEAKER                187
 #define IDD_NF_LOUDNESS_ANALYZE_PROGRESS 188 // #880
 #define IDC_ERASER                      189 // NF Eraser tool
+#define IDD_LINK_ACTOR                  190
 #define IDB_UP                          500
 #define IDB_DOWN                        501
 #define IDC_BUTTON1                     1000
@@ -320,6 +321,7 @@
 #define IDC_DRAGSCALE                   1230
 #define IDC_LIST1                       1231
 #define IDC_LIST2                       1232
+#define IDC_LIST3                       1233
 #define IDC_PROGRESS                    1234
 #define IDC_GROUP1                      1236
 #define IDC_GROUP2                      1237
@@ -452,7 +454,7 @@
 // 
 #ifdef APSTUDIO_INVOKED
 #ifndef APSTUDIO_READONLY_SYMBOLS
-#define _APS_NEXT_RESOURCE_VALUE        189
+#define _APS_NEXT_RESOURCE_VALUE        191
 #define _APS_NEXT_COMMAND_VALUE         40000
 #define _APS_NEXT_CONTROL_VALUE         1362
 #define _APS_NEXT_SYMED_VALUE           100

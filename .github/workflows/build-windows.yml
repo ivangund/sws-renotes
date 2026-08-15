@@ -1,0 +1,39 @@
+name: Build Windows
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Install dependencies
+        run: choco install php strawberryperl nsis --yes --no-progress
+
+      - name: Configure
+        shell: bash
+        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Package
+        working-directory: build
+        run: cpack -G NSIS -C Release
+
+      - name: Upload package
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-windows
+          path: build/sws-*.exe
+          if-no-files-found: error

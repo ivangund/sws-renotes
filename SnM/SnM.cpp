@@ -353,27 +353,60 @@ static COMMAND_T s_cmdTable[] =
 	{ { DEFACCEL, "SWS/S&M: Delete active take and source file in selected items (prompt, no undo)" }, "S&M_DELTAKEANDFILE3", DeleteTakeAndMedia, NULL, 3},
 	{ { DEFACCEL, "SWS/S&M: Delete active take and source file in selected items (no undo)" }, "S&M_DELTAKEANDFILE4", DeleteTakeAndMedia, NULL, 4},
 
-	// Notes ------------------------------------------------------------------
-	{ { DEFACCEL, "SWS/S&M: Open/close Notes window" }, "S&M_SHOW_NOTES_VIEW", OpenNotes, NULL, -1, IsNotesDisplayed},
-	{ { DEFACCEL, "SWS/S&M: Open/close Notes window (project notes)" }, "S&M_SHOWNOTESHELP", OpenNotes, NULL, SNM_NOTES_PROJECT, IsNotesDisplayed},
-	{ { DEFACCEL, "SWS/S&M: Open/close Notes window (extra project notes)" }, "S&M_EXTRAPROJECTNOTES", OpenNotes, NULL, SNM_NOTES_PROJECT_EXTRA, IsNotesDisplayed},
+  // ReNotes ----------------------------------------------------------------
+  { { DEFACCEL, "SWS/S&M: ReNotes - Открыть/закрыть"}, "S&M_SHOW_NOTES_VIEW", OpenNotes, NULL, -1, IsNotesDisplayed},
+	{ { DEFACCEL, "SWS/S&M: ReNotes - Открыть/закрыть (заметки проекта)"}, "S&M_SHOWNOTESHELP", OpenNotes, NULL, SNM_NOTES_PROJECT, IsNotesDisplayed},
+	{ { DEFACCEL, "SWS/S&M: ReNotes - Открыть/закрыть (доп. заметки проекта)"}, "S&M_EXTRAPROJECTNOTES", OpenNotes, NULL, SNM_NOTES_PROJECT_EXTRA, IsNotesDisplayed},
 	// #647
-	{ { DEFACCEL, "SWS/S&M: Open/close Notes window (global notes)" }, "S&M_GLOBALNOTES", OpenNotes, NULL, SNM_NOTES_GLOBAL, IsNotesDisplayed },
-	{ { DEFACCEL, "SWS/S&M: Open/close Notes window (item notes)" }, "S&M_ITEMNOTES", OpenNotes, NULL, SNM_NOTES_ITEM, IsNotesDisplayed},
-	{ { DEFACCEL, "SWS/S&M: Open/close Notes window (track notes)" }, "S&M_TRACKNOTES", OpenNotes, NULL, SNM_NOTES_TRACK, IsNotesDisplayed},
-	{ { DEFACCEL, "SWS/S&M: Open/close Notes window (marker names)" }, "S&M_MKR_NAMES", OpenNotes, NULL, SNM_NOTES_MKR_NAME, IsNotesDisplayed},
-	{ { DEFACCEL, "SWS/S&M: Open/close Notes window (region names)" }, "S&M_RGN_NAMES", OpenNotes, NULL, SNM_NOTES_RGN_NAME, IsNotesDisplayed},
-	{ { DEFACCEL, "SWS/S&M: Open/close Notes window (marker/region names)" }, "S&M_MARKERNAMES", OpenNotes, NULL, SNM_NOTES_MKRRGN_NAME, IsNotesDisplayed}, // custom id poorly named for historical reasons...
-	{ { DEFACCEL, "SWS/S&M: Open/close Notes window (marker subtitles)" }, "S&M_MKR_SUBTITLES", OpenNotes, NULL, SNM_NOTES_MKR_SUB, IsNotesDisplayed},
-	{ { DEFACCEL, "SWS/S&M: Open/close Notes window (region subtitles)" }, "S&M_RGN_SUBTITLES", OpenNotes, NULL, SNM_NOTES_RGN_SUB, IsNotesDisplayed},
-	{ { DEFACCEL, "SWS/S&M: Open/close Notes window (marker/region subtitles)" }, "S&M_MARKERSUBTITLES", OpenNotes, NULL, SNM_NOTES_MKRRGN_SUB, IsNotesDisplayed}, // custom id poorly named for historical reasons...
-#if defined(_WIN32) && defined(WANT_ACTION_HELP)
-	{ { DEFACCEL, "SWS/S&M: Open/close Notes window (action help)" }, "S&M_ACTIONHELP", OpenNotes, NULL, SNM_NOTES_ACTION_HELP, IsNotesDisplayed},
-	{ { DEFACCEL, "SWS/S&M: Notes - Set action help file..." }, "S&M_ACTIONHELPPATH", SetActionHelpFilename, NULL, },
-#endif
-	{ { DEFACCEL, "SWS/S&M: Notes - Toggle lock" }, "S&M_ACTIONHELPTGLOCK", ToggleNotesLock, NULL, 0, IsNotesLocked},
-	{ { DEFACCEL, "SWS/S&M: Notes - Import subtitle file..." }, "S&M_IMPORT_SUBTITLE", ImportSubTitleFile, NULL, },
-	{ { DEFACCEL, "SWS/S&M: Notes - Export subtitle file..." }, "S&M_EXPORT_SUBTITLE", ExportSubTitleFile, NULL, },
+	{ { DEFACCEL, "SWS/S&M: ReNotes - Открыть/закрыть (глобальные заметки)"}, "S&M_GLOBALNOTES", OpenNotes, NULL, SNM_NOTES_GLOBAL, IsNotesDisplayed },
+	{ { DEFACCEL, "SWS/S&M: ReNotes - Открыть/закрыть (заметки айтема)"}, "S&M_ITEMNOTES", OpenNotes, NULL, SNM_NOTES_ITEM, IsNotesDisplayed},
+	{ { DEFACCEL, "SWS/S&M: ReNotes - Открыть/закрыть (заметки дорожки)"}, "S&M_TRACKNOTES", OpenNotes, NULL, SNM_NOTES_TRACK, IsNotesDisplayed},
+	{ { DEFACCEL, "SWS/S&M: ReNotes - Открыть/закрыть (субтитры)"}, "S&M_RGN_SUBTITLES", OpenNotes, NULL, SNM_NOTES_RGN_SUB, IsNotesDisplayed},
+	{ { DEFACCEL, "SWS/S&M: ReNotes - Переключить блокировку текста"}, "S&M_ACTIONHELPTGLOCK", ToggleNotesLock, NULL, 0, IsNotesLocked},
+	{ { DEFACCEL, "SWS/S&M: ReNotes - Добавить субтитры"}, "S&M_IMPORT_SUBTITLE", ImportSubTitleFile, NULL, },
+	{ { DEFACCEL, "SWS/S&M: ReNotes - Отображать цветные регионы"}, "S&M_COLORED_REGIONS",
+    ToggleColoredRegions,
+    NULL, 0, IsColoredRegions
+  },
+  {
+    {DEFACCEL, "SWS/S&M: ReNotes - Очистить субтитры"}, "S&M_CLEAR_SUBTITLES",
+    ClearAllSubtitlesAction, NULL,
+  },
+  {
+    {DEFACCEL, "SWS/S&M: ReNotes - Все персонажи (актёры) активны"}, "S&M_ENABLE_ALL_ACTORS",
+    EnableAllActors, NULL,
+  },
+  {
+    {DEFACCEL, "SWS/S&M: ReNotes - Все персонажи (актёры) неактивны"}, "S&M_DISABLE_ALL_ACTORS",
+    DisableAllActors, NULL,
+  },
+  {
+    {DEFACCEL, "SWS/S&M: ReNotes - Импортировать ролёвку"}, "S&M_IMPORT_ROLES",
+    ImportRolesAction, NULL,
+  },
+  {
+    {DEFACCEL, "SWS/S&M: ReNotes - Экспортировать ролёвку"}, "S&M_EXPORT_ROLES",
+    ExportRolesAction, NULL,
+  },
+  {
+    {DEFACCEL, "SWS/S&M: ReNotes - Переключить скрытие регионов"}, "S&M_TOGGLE_HIDE_REGIONS",
+    ToggleHideRegions, NULL, 0, IsHideRegions
+  },
+  {
+    {DEFACCEL, "SWS/S&M: ReNotes - Переключить скрытие ролёвки"}, "S&M_TOGGLE_HIDE_ACTOR_LIST",
+    ToggleHideActorList, NULL, 0, IsHideActorList
+  },
+  {
+    {DEFACCEL, "SWS/S&M: ReNotes - Переключить отображение актёра в префиксе"},
+    "S&M_TOGGLE_ACTOR_PREFIX", ToggleDisplayActorInPrefix, NULL, 0, IsDisplayActorInPrefix
+  },
+  {
+    {DEFACCEL, "SWS/S&M: ReNotes - Скопировать маркеры в буфер обмена"}, "S&M_COPY_RGN_MARKERS",
+    CopyMarkersAction, NULL,
+  },
+  {
+    {DEFACCEL, "SWS/S&M: ReNotes - Скопировать ролёвку в буфер обмена"},
+    "S&M_COPY_ROLE_DISTRIBUTION", CopyRoleDistributionAction, NULL, },
 
 	// Split ------------------------------------------------------------------
 	{ { DEFACCEL, "SWS/S&M: Split selected items at edit cursor (MIDI) or prior zero crossing (audio)" }, "S&M_SPLIT1", SplitMidiAudio, NULL, },
@@ -587,9 +620,9 @@ static COMMAND_T s_cmdTable[] =
 	{ { DEFACCEL, "SWS/S&M: Takes - Build lanes for selected items" }, "S&M_LANETAKE3", BuildLanes, NULL, 1},
 
 	// contrary to their native versions, the following actions were spliting selected items *and only them*
-	// (http://forum.cockos.com/showthread.php?t=51547) => removed because of REAPER v3.67's new native pref 
-	// "if no items are selected, some split/trim/delete actions affect all items at the edit cursor", those 
-	// actions are less useful: they would still split only selected items, even if that native pref is ticked. 
+	// (http://forum.cockos.com/showthread.php?t=51547) => removed because of REAPER v3.67's new native pref
+	// "if no items are selected, some split/trim/delete actions affect all items at the edit cursor", those
+	// actions are less useful: they would still split only selected items, even if that native pref is ticked.
 	{ { DEFACCEL, "SWS/S&M: Split selected items at play cursor" }, "S&M_SPLIT3", SplitSelectedItems, NULL, 40196},
 	{ { DEFACCEL, "SWS/S&M: Split selected items at time selection" }, "S&M_SPLIT4", SplitSelectedItems, NULL, 40061},
 	{ { DEFACCEL, "SWS/S&M: Split selected items at edit cursor (no change selection)" }, "S&M_SPLIT5", SplitSelectedItems, NULL, 40757},
@@ -609,19 +642,19 @@ static COMMAND_T s_cmdTable[] =
 
 
 ///////////////////////////////////////////////////////////////////////////////
-// S&M dynamic actions: the number of instances of these actions can be 
+// S&M dynamic actions: the number of instances of these actions can be
 // customized in the S&M.ini file, section [NbOfActions].
 // In the following table:
-// - a function doCommand(COMMAND_T*) or getEnabled(COMMAND_T*) will be 
+// - a function doCommand(COMMAND_T*) or getEnabled(COMMAND_T*) will be
 //   triggered with 0-based COMMAND_T.user
 // - action names are formatted strings, they *must* contain "%d"
 // - custom command ids are not formated strings, but final ids will end with
 //   slot numbers (1-based for display reasons)
-// Example: 
+// Example:
 //   { "Do stuff %d", "DO_STUFF", doStuff, 2, SNM_MAX_DYN_ACTIONS, NULL }
-//   if not overrided in the S&M.ini file (e.g. "DO_STUFF=32"), 2 actions will 
-//   be created: "Do stuff 1" and "Do stuff 2" both calling doStuff(c) with 
-//   c->user=0 and c->user=1, respectively. custom ids will be "_DO_STUFF1"  
+//   if not overrided in the S&M.ini file (e.g. "DO_STUFF=32"), 2 actions will
+//   be created: "Do stuff 1" and "Do stuff 2" both calling doStuff(c) with
+//   c->user=0 and c->user=1, respectively. custom ids will be "_DO_STUFF1"
 //   and "_DO_STUFF2", repectively.
 ///////////////////////////////////////////////////////////////////////////////
 
@@ -922,7 +955,7 @@ const SECTION_INFO_T *SNM_GetActionSectionInfo(int _idx)
 
 ///////////////////////////////////////////////////////////////////////////////
 // Fake toggle states
-// Those fake states are automatically toggled when actions are performed, 
+// Those fake states are automatically toggled when actions are performed,
 // see hookCommandProc()
 ///////////////////////////////////////////////////////////////////////////////
 
@@ -941,23 +974,23 @@ int GetFakeToggleState(COMMAND_T* _ct) {
 void ExclusiveToggle(COMMAND_T* _ct)
 {
 /*JFB commented: the proper solution should look like this + related funcs
-   like ExclusiveToggleA(COMMAND_T*), ExclusiveToggleB, etc but such func 
-   pointers are messed-up (inlined) in release builds
-   anyway, replaced with code below: faster but it first aims at avoiding
-   function pointers
+     like ExclusiveToggleA(COMMAND_T*), ExclusiveToggleB, etc but such func
+     pointers are messed-up (inlined) in release builds
+     anyway, replaced with code below: faster but it first aims at avoiding
+     function pointers
 
-	if (_ct && _ct->fakeToggle)
-		for (INT_PTR i=0; i<SNM_MAX_DYN_ACTIONS; i++)
-			if (COMMAND_T* ct = SWSGetCommand(_ct->doCommand, i))
-			{
-				if (ct->cmdId != _ct->cmdId) {
-					ct->fakeToggle = false;
-					RefreshToolbar(ct->cmdId);
-				}
-			}
-			else
-				break;
-*/
+      if (_ct && _ct->fakeToggle)
+          for (INT_PTR i=0; i<SNM_MAX_DYN_ACTIONS; i++)
+              if (COMMAND_T* ct = SWSGetCommand(_ct->doCommand, i))
+              {
+                  if (ct->cmdId != _ct->cmdId) {
+                      ct->fakeToggle = false;
+                      RefreshToolbar(ct->cmdId);
+                  }
+              }
+              else
+                  break;
+  */
 	//JFB! enough ATM but relies on *ordered* cmds, cmd ids, etc
 	int id = _ct->cmdId - (int)_ct->user;
 	for (int i=0; i<SNM_MAX_DYN_ACTIONS; i++)
@@ -1239,7 +1272,7 @@ int SNM_Init(reaper_plugin_info_t* _rec)
 	SNM_ProjectInit();
 	CyclactionInit();
 
-	// callback when REAPER is fully initialized 
+	// callback when REAPER is fully initialized
 	plugin_register("timer",(void*)OnInitTimer);
 
 	return 1;

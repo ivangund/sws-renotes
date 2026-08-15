@@ -297,7 +297,7 @@ void SWSCreateExtensionsMenu(HMENU hExtensionsMenu)
 	AddToMenu(hMarkerSubMenu, __LOCALIZE("Select prev region", "sws_ext_menu"), NamedCommandLookup("_SWS_SELPREVREG"));
 	AddToMenu(hMarkerSubMenu, __LOCALIZE("Delete all markers", "sws_ext_menu"), NamedCommandLookup("_SWSMARKERLIST9"));
 	AddToMenu(hMarkerSubMenu, __LOCALIZE("Delete all regions", "sws_ext_menu"), NamedCommandLookup("_SWSMARKERLIST10"));
-	AddToMenu(hMenu, __LOCALIZE("Notes", "sws_ext_menu"), NamedCommandLookup("_S&M_SHOW_NOTES_VIEW"));
+	AddToMenu(hMenu, __LOCALIZE("ReNotes", "sws_ext_menu"), NamedCommandLookup("_S&M_SHOW_NOTES_VIEW"));
 
 	HMENU hPrjMgmtSubMenu = CreatePopupMenu();
 	AddSubMenu(hMenu, hPrjMgmtSubMenu, __LOCALIZE("Project Management", "sws_ext_menu"));
