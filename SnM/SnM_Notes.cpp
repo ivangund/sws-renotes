@@ -50,10 +50,13 @@
 #include "SnM_Util.h"
 #include "SnM_Window.h"
 
+#include "../Breeder/BR_ReaScript.h"
 #include "../cfillion/cfillion.hpp"
 
 #include <WDL/localize/localize.h>
 #include <WDL/projectcontext.h>
+
+#include <unordered_map>
 
 #define NOTES_WND_ID				"SnMNotesHelp"
 #define NOTES_INI_SEC				"Notes"
@@ -77,6 +80,8 @@ enum {
   COPY_MARKERS_MSG,
   COPY_ROLE_DISTRIBUTION_MSG,
   COPY_CURRENT_PHRASE_MSG,
+  SELECT_LINKED_ACTOR_ROLES_MSG,
+  CREATE_SUBTITLE_ITEMS_TRACK_MSG,
   LAST_MSG // keep as last item!
 };
 
@@ -124,6 +129,7 @@ void HideAllRegions();
 void ShowAllRegions();
 bool ExportRolesFile(const char *fn);
 bool ImportRolesFile(const char *fn);
+void SyncSubtitleItemsTrack(bool createIfMissing);
 
 int g_notesType = -1;
 int g_prevNotesType = -1;
@@ -492,6 +498,186 @@ void RecreateActorRegions(const char *actorName) {
   UpdateTimeline();
 }
 
+static const char *RENOTES_ITEMS_TRACK_TAG = "P_EXT:SWS_RENOTES_SUBTITLE_ITEMS";
+static const char *RENOTES_ITEM_KEY_TAG = "P_EXT:SWS_RENOTES_SUBTITLE_KEY";
+
+static MediaTrack *FindSubtitleItemsTrack() {
+  char tag[16];
+  for (int i = 0; i < GetNumTracks(); i++) {
+    MediaTrack *track = GetTrack(NULL, i);
+    tag[0] = '\0';
+    if (track && GetSetMediaTrackInfo_String(track, RENOTES_ITEMS_TRACK_TAG, tag, false)
+        && !strcmp(tag, "1"))
+      return track;
+  }
+  return NULL;
+}
+
+static SNM_Actor *FindActor(const char *name) {
+  WDL_PtrList_DOD<SNM_Actor> *actors = g_actors.Get();
+  for (int i = 0; i < actors->GetSize(); i++) {
+    SNM_Actor *actor = actors->Get(i);
+    if (actor && !strcmp(actor->GetName(), name))
+      return actor;
+  }
+  return NULL;
+}
+
+struct SubtitleItemEntry {
+  SNM_RegionSubtitle *subtitle;
+  SNM_Actor *actor;
+  double start;
+  double end;
+  int sourceIndex;
+  int lane;
+  int laneCount;
+  MediaItem *item;
+};
+
+static void BuildSubtitleItemKey(const SubtitleItemEntry &entry, WDL_FastString *key) {
+  key->SetFormatted(512, "%d:%s", entry.sourceIndex, entry.actor->GetName());
+}
+
+static void BuildSubtitleItemText(const SubtitleItemEntry &entry, WDL_FastString *text) {
+  text->Append(entry.subtitle->GetNotes());
+}
+
+void SyncSubtitleItemsTrack(bool createIfMissing) {
+  MediaTrack *track = FindSubtitleItemsTrack();
+  if (!track && !createIfMissing)
+    return;
+
+  Undo_BeginBlock2(NULL);
+  if (!track) {
+    const int index = GetNumTracks();
+    InsertTrackAtIndex(index, true);
+    track = GetTrack(NULL, index);
+    if (!track) {
+      Undo_EndBlock2(NULL, __LOCALIZE("ReNotes: создать дорожку реплик", "sws_DLG_152"),
+                     UNDO_STATE_TRACKCFG);
+      return;
+    }
+    GetSetMediaTrackInfo_String(track, "P_NAME", (char *) "ReNotes Subtitles", true);
+    GetSetMediaTrackInfo_String(track, RENOTES_ITEMS_TRACK_TAG, (char *) "1", true);
+  }
+
+  PreventUIRefresh(1);
+
+  std::unordered_map<std::string, MediaItem *> existingItems;
+  std::vector<MediaItem *> staleItems;
+  char itemKey[1024];
+  for (int i = 0; i < CountTrackMediaItems(track); i++) {
+    MediaItem *item = GetTrackMediaItem(track, i);
+    itemKey[0] = '\0';
+    if (item && GetSetMediaItemInfo_String(item, RENOTES_ITEM_KEY_TAG, itemKey, false)
+        && itemKey[0] && existingItems.find(itemKey) == existingItems.end())
+      existingItems[itemKey] = item;
+    else if (item)
+      staleItems.push_back(item);
+  }
+
+  std::vector<SubtitleItemEntry> entries;
+  WDL_PtrList_DOD<SNM_RegionSubtitle> *subtitles = g_pRegionSubs.Get();
+  for (int i = 0; i < subtitles->GetSize(); i++) {
+    SNM_RegionSubtitle *subtitle = subtitles->Get(i);
+    if (!subtitle || !subtitle->GetNotesLength())
+      continue;
+    SNM_Actor *actor = FindActor(subtitle->GetActor());
+    if (!actor || !actor->IsEnabled())
+      continue;
+
+    double start = subtitle->GetStartTime();
+    double end = subtitle->GetEndTime();
+    if (subtitle->IsValid()
+        && EnumMarkerRegionById(NULL, subtitle->GetId(), NULL, &start, &end,
+                                NULL, NULL, NULL) < 0)
+      continue;
+    if (end <= start)
+      continue;
+    subtitle->SetTimes(start, end);
+    entries.push_back({subtitle, actor, start, end, i, 0, 1, NULL});
+  }
+
+  std::sort(entries.begin(), entries.end(), [](const SubtitleItemEntry &a,
+                                                const SubtitleItemEntry &b) {
+    if (a.start != b.start) return a.start < b.start;
+    if (a.end != b.end) return a.end < b.end;
+    return strcmp(a.subtitle->GetActor(), b.subtitle->GetActor()) < 0;
+  });
+
+  for (size_t groupStart = 0; groupStart < entries.size();) {
+    size_t groupEnd = groupStart + 1;
+    double groupEndTime = entries[groupStart].end;
+    while (groupEnd < entries.size()
+           && entries[groupEnd].start < groupEndTime - 0.000001) {
+      groupEndTime = std::max(groupEndTime, entries[groupEnd].end);
+      groupEnd++;
+    }
+
+    std::vector<double> laneEnds;
+    for (size_t i = groupStart; i < groupEnd; i++) {
+      int lane = 0;
+      while (lane < (int) laneEnds.size()
+             && entries[i].start < laneEnds[lane] - 0.000001)
+        lane++;
+      if (lane == (int) laneEnds.size())
+        laneEnds.push_back(entries[i].end);
+      else
+        laneEnds[lane] = entries[i].end;
+      entries[i].lane = lane;
+    }
+    const int laneCount = std::max(1, (int) laneEnds.size());
+    for (size_t i = groupStart; i < groupEnd; i++)
+      entries[i].laneCount = laneCount;
+    groupStart = groupEnd;
+  }
+
+  SetMediaTrackInfo_Value(track, "I_FREEMODE", 1.0);
+
+  for (SubtitleItemEntry &entry : entries) {
+    WDL_FastString key;
+    BuildSubtitleItemKey(entry, &key);
+    const auto oldItem = existingItems.find(key.Get());
+    MediaItem *item = oldItem == existingItems.end()
+      ? AddMediaItemToTrack(track) : oldItem->second;
+    if (!item)
+      continue;
+    const bool isNew = oldItem == existingItems.end();
+    if (!isNew)
+      existingItems.erase(oldItem);
+    else
+      GetSetMediaItemInfo_String(item, RENOTES_ITEM_KEY_TAG, (char *) key.Get(), true);
+    entry.item = item;
+
+    SetMediaItemInfo_Value(item, "D_POSITION", entry.start);
+    SetMediaItemInfo_Value(item, "D_LENGTH", entry.end - entry.start);
+    SetMediaItemInfo_Value(item, "I_CUSTOMCOLOR", entry.actor->GetEffectiveColor());
+    SetMediaItemInfo_Value(item, "F_FREEMODE_Y",
+                           (double) entry.lane / entry.laneCount);
+    SetMediaItemInfo_Value(item, "F_FREEMODE_H", 1.0 / entry.laneCount);
+
+    WDL_FastString itemText;
+    BuildSubtitleItemText(entry, &itemText);
+    const char *oldText = (const char *) GetSetMediaItemInfo(item, "P_NOTES", NULL);
+    if (!oldText || strcmp(oldText, itemText.Get()))
+      GetSetMediaItemInfo(item, "P_NOTES", (void *) itemText.Get());
+    if (isNew)
+      BR_SetMediaItemImageResource(item, "", 3 | 8);
+  }
+
+  for (const auto &oldItem : existingItems)
+    staleItems.push_back(oldItem.second);
+  for (MediaItem *item : staleItems)
+    DeleteTrackMediaItem(track, item);
+
+  MarkProjectDirty(NULL);
+  TrackList_AdjustWindows(false);
+  UpdateTimeline();
+  PreventUIRefresh(-1);
+  Undo_EndBlock2(NULL, __LOCALIZE("ReNotes: обновить дорожку реплик", "sws_DLG_152"),
+                 UNDO_STATE_ITEMS | UNDO_STATE_TRACKCFG);
+}
+
 void UpdateRegionColors() {
   if (g_hideRegions) return;
   WDL_PtrList_DOD<SNM_RegionSubtitle> *subs = g_pRegionSubs.Get();
@@ -548,7 +734,7 @@ struct MarkerEntry {
   WDL_FastString text;
 };
 
-static void CopyMarkersToClipboard(HWND hwnd) {
+static void CopyMarkersToClipboardLegacy(HWND hwnd) {
   WDL_PtrList_DOD<SNM_RegionSubtitle> *subs = g_pRegionSubs.Get();
   WDL_PtrList_DOD<SNM_Actor> *actors = g_actors.Get();
   if (!subs->GetSize()) return;
@@ -709,6 +895,186 @@ static void CopyMarkersToClipboard(HWND hwnd) {
     for (int i = 0; i < groups.Get(g)->GetSize(); i++)
       delete groups.Get(g)->Get(i);
   }
+}
+
+struct ClipboardMarkerEntry {
+  double position;
+  std::string text;
+};
+
+struct ClipboardRegionEntry {
+  double start;
+  double end;
+  int number;
+  std::string text;
+};
+
+struct ClipboardTextEntry {
+  double start;
+  double end;
+  std::string text;
+  std::string group;
+};
+
+struct ClipboardTextGroup {
+  std::string name;
+  std::vector<ClipboardTextEntry> entries;
+};
+
+static std::string FlattenClipboardText(const char *source) {
+  std::string result;
+  const char *p = source ? source : "";
+  while (*p) {
+    int breakLength = 0;
+    if (*p == '\\' && (p[1] == 'N' || p[1] == 'n'))
+      breakLength = 2;
+    else if (*p == '\r' && p[1] == '\n')
+      breakLength = 2;
+    else if (*p == '\r' || *p == '\n')
+      breakLength = 1;
+    if (breakLength) {
+      while (!result.empty() && result.back() == ' ')
+        result.pop_back();
+      p += breakLength;
+      while (*p == ' ')
+        p++;
+      if (!result.empty() && *p)
+        result.push_back(' ');
+    } else {
+      result.push_back(*p++);
+    }
+  }
+  return result;
+}
+
+static void CopyMarkersToClipboard(HWND hwnd) {
+  std::vector<ClipboardMarkerEntry> markers;
+  std::vector<ClipboardRegionEntry> regions;
+  int enumIndex = 0;
+  bool isRegion = false;
+  double position = 0.0;
+  double regionEnd = 0.0;
+  const char *name = NULL;
+  int number = 0;
+  while ((enumIndex = EnumProjectMarkers2(NULL, enumIndex, &isRegion,
+                                           &position, &regionEnd, &name, &number))) {
+    if (isRegion)
+      regions.push_back({position, regionEnd, number, name ? name : ""});
+    else
+      markers.push_back({position, name ? name : ""});
+  }
+
+  WDL_PtrList_DOD<SNM_RegionSubtitle> *subtitles = g_pRegionSubs.Get();
+  std::vector<ClipboardTextEntry> entries;
+  for (const ClipboardRegionEntry &region : regions) {
+    std::vector<const ClipboardMarkerEntry *> insideMarkers;
+    for (const ClipboardMarkerEntry &marker : markers) {
+      if (marker.position >= region.start && marker.position < region.end)
+        insideMarkers.push_back(&marker);
+    }
+    SNM_RegionSubtitle *subtitle = NULL;
+    const int regionId = MakeMarkerRegionId(region.number, true);
+    for (int i = 0; i < subtitles->GetSize(); i++) {
+      SNM_RegionSubtitle *candidate = subtitles->Get(i);
+      if (candidate && candidate->IsValid() && candidate->GetId() == regionId) {
+        subtitle = candidate;
+        break;
+      }
+    }
+
+    std::string text = FlattenClipboardText(
+      subtitle ? subtitle->GetNotes() : region.text.c_str());
+    if (text.empty())
+      continue;
+    for (const ClipboardMarkerEntry *marker : insideMarkers) {
+      std::string markerText = FlattenClipboardText(marker->text.c_str());
+      if (!markerText.empty()) {
+        text.append(" (");
+        text.append(markerText);
+        text.push_back(')');
+      }
+    }
+
+    std::string group;
+    if (subtitle) {
+      SNM_Actor *actor = FindActor(subtitle->GetActor());
+      if (actor && actor->HasLinkedActor())
+        group = actor->GetLinkedActorName();
+    }
+    entries.push_back({region.start, region.end, text, group});
+  }
+
+  std::sort(entries.begin(), entries.end(), [](const ClipboardTextEntry &a,
+                                                const ClipboardTextEntry &b) {
+    if (a.group != b.group)
+      return a.group < b.group;
+    if (a.start != b.start)
+      return a.start < b.start;
+    return a.end < b.end;
+  });
+
+  std::vector<ClipboardTextEntry> unlinked;
+  std::vector<ClipboardTextGroup> groups;
+  for (const ClipboardTextEntry &entry : entries) {
+    if (entry.group.empty()) {
+      unlinked.push_back(entry);
+      continue;
+    }
+    ClipboardTextGroup *target = NULL;
+    for (ClipboardTextGroup &group : groups) {
+      if (group.name == entry.group) {
+        target = &group;
+        break;
+      }
+    }
+    if (!target) {
+      groups.push_back({entry.group, {}});
+      target = &groups.back();
+    }
+    target->entries.push_back(entry);
+  }
+
+  auto sortByTime = [](std::vector<ClipboardTextEntry> &items) {
+    std::sort(items.begin(), items.end(), [](const ClipboardTextEntry &a,
+                                             const ClipboardTextEntry &b) {
+      if (a.start != b.start)
+        return a.start < b.start;
+      return a.end < b.end;
+    });
+  };
+  sortByTime(unlinked);
+  for (ClipboardTextGroup &group : groups)
+    sortByTime(group.entries);
+
+  WDL_FastString output;
+  auto appendEntries = [&output](const std::vector<ClipboardTextEntry> &items) {
+    for (const ClipboardTextEntry &entry : items) {
+      char startBuffer[32];
+      char endBuffer[32];
+      FormatSubTime(entry.start, startBuffer, sizeof(startBuffer));
+      FormatSubTime(entry.end, endBuffer, sizeof(endBuffer));
+      output.AppendFormatted(512, "%s-%s %s\n", startBuffer, endBuffer,
+                             entry.text.c_str());
+    }
+  };
+
+  appendEntries(unlinked);
+  for (const ClipboardTextGroup &group : groups) {
+    if (output.GetLength() > 0)
+      output.Append("\n");
+    output.AppendFormatted(256, "%s\n", group.name.c_str());
+    appendEntries(group.entries);
+  }
+  if (output.GetLength() > 0 && output.Get()[output.GetLength() - 1] == '\n')
+    output.DeleteSub(output.GetLength() - 1, 1);
+
+  if (output.GetLength() > 0)
+    CF_SetClipboard(output.Get());
+  else
+    MessageBox(hwnd,
+               __LOCALIZE("Нет регионов с текстом.", "sws_DLG_152"),
+               __LOCALIZE("ReNotes", "sws_DLG_152"),
+               MB_OK);
 }
 
 static WDL_DLGRET LinkActorDlgProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lParam) {
@@ -875,6 +1241,9 @@ void NotesWnd::OnCommand(WPARAM wParam, LPARAM lParam)
         CF_SetClipboard(output.Get());
     }
     break;
+    case CREATE_SUBTITLE_ITEMS_TRACK_MSG:
+      SyncSubtitleItemsTrack(true);
+      break;
     case COPY_ROLE_DISTRIBUTION_MSG:
       CopyRoleDistributionAction(NULL);
 			break;
@@ -930,6 +1299,7 @@ void NotesWnd::OnCommand(WPARAM wParam, LPARAM lParam)
           }
           UpdateRegionColors();
           RefreshActorList();
+          SyncSubtitleItemsTrack(false);
           MarkProjectDirty(NULL);
         }
       }
@@ -940,6 +1310,29 @@ void NotesWnd::OnCommand(WPARAM wParam, LPARAM lParam)
         m_contextMenuActor->SetHasCustomColor(false);
         m_contextMenuActor->SetColor(GenerateActorColor(m_contextMenuActor->GetName()));
         UpdateRegionColors();
+        RefreshActorList();
+        SyncSubtitleItemsTrack(false);
+        MarkProjectDirty(NULL);
+      }
+      break;
+    case SELECT_LINKED_ACTOR_ROLES_MSG:
+      if (m_contextMenuActor && m_contextMenuActor->HasLinkedActor()) {
+        const char *linkedActor = m_contextMenuActor->GetLinkedActorName();
+        WDL_PtrList_DOD<SNM_Actor> *actors = g_actors.Get();
+        for (int i = 0; i < actors->GetSize(); i++) {
+          SNM_Actor *actor = actors->Get(i);
+          const bool enable = actor->HasLinkedActor()
+            && !strcmp(actor->GetLinkedActorName(), linkedActor);
+          if (actor->IsEnabled() == enable)
+            continue;
+          actor->SetEnabled(enable);
+          if (enable)
+            RecreateActorRegions(actor->GetName());
+          else
+            DeleteActorRegions(actor->GetName());
+        }
+        SyncSubtitleItemsTrack(false);
+        UpdateTimeline();
         RefreshActorList();
         MarkProjectDirty(NULL);
       }
@@ -965,6 +1358,7 @@ void NotesWnd::OnCommand(WPARAM wParam, LPARAM lParam)
           }
           UpdateRegionColors();
           RefreshActorList();
+          SyncSubtitleItemsTrack(false);
           MarkProjectDirty(NULL);
         }
       }
@@ -1016,6 +1410,7 @@ void NotesWnd::OnCommand(WPARAM wParam, LPARAM lParam)
           RefreshActorList();
           ForceUpdateRgnSub();
           RefreshGUI();
+          SyncSubtitleItemsTrack(false);
           MarkProjectDirty(NULL);
         } else
           MessageBox(m_hwnd,
@@ -1070,6 +1465,12 @@ HMENU NotesWnd::OnContextMenu(int x, int y, bool* wantDefaultItems)
                     CHANGE_COLOR_MSG,
                     -1,
                     false);
+          if (m_contextMenuActor->HasLinkedActor())
+            AddToMenu(hMenu,
+                      __LOCALIZE("Включить только роли этого актёра", "sws_DLG_152"),
+                      SELECT_LINKED_ACTOR_ROLES_MSG,
+                      -1,
+                      false);
           AddToMenu(hMenu, SWS_SEPARATOR, 0);
 	}
       }
@@ -1113,6 +1514,11 @@ HMENU NotesWnd::OnContextMenu(int x, int y, bool* wantDefaultItems)
     AddToMenu(hMenu,
               __LOCALIZE("Скопировать маркеры в буфер обмена\tCtrl+M", "sws_DLG_152"),
               COPY_MARKERS_MSG,
+              -1,
+              false);
+    AddToMenu(hMenu,
+              __LOCALIZE("Создать дорожку с репликами", "sws_DLG_152"),
+              CREATE_SUBTITLE_ITEMS_TRACK_MSG,
               -1,
               false);
 
@@ -1237,12 +1643,14 @@ int NotesWnd::OnKey(MSG* _msg, int _iKeyState)
                     if (imported) {
                       MarkProjectDirty(NULL);
                       RefreshActorList();
+                      SyncSubtitleItemsTrack(false);
                     }
                     if (rolesImported) {
                       UpdateRegionColors();
                       RefreshActorList();
                       ForceUpdateRgnSub();
                       RefreshGUI();
+                      SyncSubtitleItemsTrack(false);
                       MarkProjectDirty(NULL);
                     }
                   }
@@ -2567,6 +2975,7 @@ void ActorListView::OnItemClk(SWS_ListItem *item, int iCol, int iKeyState) {
 
   if (g_hideRegions)
     g_lastMarkerPos = -1.0;
+  SyncSubtitleItemsTrack(false);
   Update();
 }
 
@@ -2699,6 +3108,99 @@ bool ActorListView::GetCustomColumnColor(SWS_ListItem *item,
   return false;
 }
 
+static std::vector<std::string> SplitAssActors(const char *actorStart, int actorLen) {
+  std::vector<std::string> actors;
+  const std::string field = actorStart && actorLen > 0
+    ? std::string(actorStart, actorLen) : std::string();
+  size_t start = 0;
+  while (start <= field.size()) {
+    const size_t separator = field.find(';', start);
+    const size_t end = separator == std::string::npos ? field.size() : separator;
+    size_t nameStart = start;
+    size_t nameEnd = end;
+    while (nameStart < nameEnd && (field[nameStart] == ' ' || field[nameStart] == '\t'))
+      nameStart++;
+    while (nameEnd > nameStart && (field[nameEnd - 1] == ' ' || field[nameEnd - 1] == '\t'))
+      nameEnd--;
+    if (nameEnd > nameStart) {
+      const std::string name = field.substr(nameStart, nameEnd - nameStart);
+      if (std::find(actors.begin(), actors.end(), name) == actors.end())
+        actors.push_back(name);
+    }
+    if (separator == std::string::npos)
+      break;
+    start = separator + 1;
+  }
+  if (actors.empty())
+    actors.push_back("?");
+  return actors;
+}
+
+static std::string TrimAssDialogueLine(const std::string &line) {
+  size_t start = 0;
+  size_t end = line.size();
+  while (start < end && (line[start] == ' ' || line[start] == '\t' || line[start] == '\r'))
+    start++;
+  while (end > start
+         && (line[end - 1] == ' ' || line[end - 1] == '\t' || line[end - 1] == '\r'))
+    end--;
+  return line.substr(start, end - start);
+}
+
+static bool StartsWithDialogueDash(const std::string &line) {
+  return !line.empty() && (line[0] == '-'
+    || line.compare(0, 3, "\xE2\x80\x93") == 0
+    || line.compare(0, 3, "\xE2\x80\x94") == 0);
+}
+
+static std::vector<std::string> SplitAssDialogueText(const char *text,
+                                                      size_t actorCount) {
+  std::vector<std::string> result(actorCount);
+  if (!actorCount)
+    return result;
+  if (actorCount == 1) {
+    result[0] = text ? text : "";
+    return result;
+  }
+
+  std::vector<std::string> lines;
+  const std::string source = text ? text : "";
+  size_t start = 0;
+  while (start <= source.size()) {
+    const size_t separator = source.find('\n', start);
+    const size_t end = separator == std::string::npos ? source.size() : separator;
+    const std::string line = TrimAssDialogueLine(source.substr(start, end - start));
+    if (!line.empty())
+      lines.push_back(line);
+    if (separator == std::string::npos)
+      break;
+    start = separator + 1;
+  }
+
+  std::vector<std::string> phrases;
+  for (const std::string &line : lines) {
+    if (phrases.empty() || StartsWithDialogueDash(line))
+      phrases.push_back(line);
+    else {
+      phrases.back().append("\n");
+      phrases.back().append(line);
+    }
+  }
+
+  if (phrases.size() != actorCount && lines.size() == actorCount)
+    phrases = lines;
+
+  const size_t directCount = std::min(actorCount, phrases.size());
+  for (size_t i = 0; i < directCount; i++)
+    result[i] = phrases[i];
+  for (size_t i = actorCount; i < phrases.size(); i++) {
+    if (!result.back().empty())
+      result.back().append("\n");
+    result.back().append(phrases[i]);
+  }
+  return result;
+}
+
 bool ImportAssFile(const char *_fn) {
   bool ok = false;
   double firstPos = -1.0;
@@ -2772,46 +3274,48 @@ bool ImportAssFile(const char *_fn) {
       notes.Append(textStart, (int) (textEnd - textStart));
       StripAssFormattingTags(&notes);
 
-      WDL_FastString actor;
-      if (actorStart && actorLen > 0)
-        actor.Append(actorStart, actorLen);
-      else
-        actor.Set("?");
-
-      SNM_Actor *actorObj = FindOrCreateActor(actor.Get());
-
-      WDL_String name;
-      BuildRegionName(&name, actor.Get(), notes.Get());
-
       double startTime = p1[0] * 3600 + p1[1] * 60 + p1[2] + double(p1cs) / 100;
       double endTime = p2[0] * 3600 + p2[1] * 60 + p2[2] + double(p2cs) / 100;
 
-      if (g_hideRegions) {
-        SNM_RegionSubtitle *sub = new SNM_RegionSubtitle(nullptr, -1, notes.Get());
-        sub->SetActor(actor.Get());
-        sub->SetTimes(startTime, endTime);
-        g_pRegionSubs.Get()->Add(sub);
-        ok = true;
-        if (firstPos < 0.0) firstPos = startTime;
-      } else {
-        int color = g_coloredRegions ? actorObj->GetEffectiveColor() : 0;
-        int num = AddProjectMarker2(NULL,
-                                    true,
-                                    startTime,
-                                    endTime,
-                                    name.Get(),
-                                    -1,
-                                    color);
-        if (num >= 0) {
+      const std::vector<std::string> actors = SplitAssActors(actorStart, actorLen);
+      const std::vector<std::string> actorNotes =
+        SplitAssDialogueText(notes.Get(), actors.size());
+      for (size_t actorIndex = 0; actorIndex < actors.size(); actorIndex++) {
+        const std::string &actorName = actors[actorIndex];
+        SNM_Actor *actorObj = FindOrCreateActor(actorName.c_str());
+        if (actorNotes[actorIndex].empty())
+          continue;
+        const char *roleNotes = actorNotes[actorIndex].c_str();
+        WDL_String name;
+        BuildRegionName(&name, actorName.c_str(), roleNotes);
+
+        if (g_hideRegions) {
+          SNM_RegionSubtitle *sub = new SNM_RegionSubtitle(nullptr, -1, roleNotes);
+          sub->SetActor(actorName.c_str());
+          sub->SetTimes(startTime, endTime);
+          g_pRegionSubs.Get()->Add(sub);
           ok = true;
-          if (firstPos < 0.0)
-            firstPos = startTime;
-          int id = MakeMarkerRegionId(num, true);
-          if (id > 0) {
-            SNM_RegionSubtitle *sub = new SNM_RegionSubtitle(nullptr, id, notes.Get());
-            sub->SetActor(actor.Get());
-            sub->SetTimes(startTime, endTime);
-            g_pRegionSubs.Get()->Add(sub);
+          if (firstPos < 0.0) firstPos = startTime;
+        } else {
+          int color = g_coloredRegions ? actorObj->GetEffectiveColor() : 0;
+          int num = AddProjectMarker2(NULL,
+                                      true,
+                                      startTime,
+                                      endTime,
+                                      name.Get(),
+                                      -1,
+                                      color);
+          if (num >= 0) {
+            ok = true;
+            if (firstPos < 0.0)
+              firstPos = startTime;
+            int id = MakeMarkerRegionId(num, true);
+            if (id > 0) {
+              SNM_RegionSubtitle *sub = new SNM_RegionSubtitle(nullptr, id, roleNotes);
+              sub->SetActor(actorName.c_str());
+              sub->SetTimes(startTime, endTime);
+              g_pRegionSubs.Get()->Add(sub);
+            }
           }
         }
       }
@@ -2932,6 +3436,7 @@ void ImportSubTitleFile(COMMAND_T* _ct)
       MarkProjectDirty(NULL);
       if (NotesWnd *w = g_notesWndMgr.Get())
         w->RefreshActorList();
+      SyncSubtitleItemsTrack(false);
     } else
 			MessageBox(GetMainHwnd(), __LOCALIZE("Некорректный файл субтитров!","sws_DLG_152"), __LOCALIZE("ReNotes - Ошибка","sws_DLG_152"), MB_OK);
 		free(fn);
@@ -2961,6 +3466,7 @@ void NotesWnd::OnDroppedFiles(HDROP h) {
         RefreshActorList();
         ForceUpdateRgnSub();
         RefreshGUI();
+        SyncSubtitleItemsTrack(false);
         MarkProjectDirty(NULL);
       } else {
         MessageBox(GetMainHwnd(),
@@ -2978,6 +3484,7 @@ void NotesWnd::OnDroppedFiles(HDROP h) {
   if (imported) {
     MarkProjectDirty(NULL);
     RefreshActorList();
+    SyncSubtitleItemsTrack(false);
   }
   DragFinish(h);
 }
@@ -3687,6 +4194,7 @@ void CopyRoleDistributionAction(COMMAND_T *) {
 
 void ClearAllSubtitlesAction(COMMAND_T *) {
   ClearAllSubtitles();
+  SyncSubtitleItemsTrack(false);
   if (NotesWnd *w = g_notesWndMgr.Get()) {
     w->RefreshActorList();
     w->Update(true);
@@ -3704,8 +4212,10 @@ void EnableAllActors(COMMAND_T *) {
   }
   if (g_hideRegions)
     g_lastMarkerPos = -1.0;
+  SyncSubtitleItemsTrack(false);
   if (NotesWnd *w = g_notesWndMgr.Get())
     w->RefreshActorList();
+  MarkProjectDirty(NULL);
 }
 
 void DisableAllActors(COMMAND_T *) {
@@ -3720,8 +4230,10 @@ void DisableAllActors(COMMAND_T *) {
   UpdateTimeline();
   if (g_hideRegions)
     g_lastMarkerPos = -1.0;
+  SyncSubtitleItemsTrack(false);
   if (NotesWnd *w = g_notesWndMgr.Get())
     w->RefreshActorList();
+  MarkProjectDirty(NULL);
 }
 
 void ImportRolesAction(COMMAND_T *) {
@@ -3739,6 +4251,7 @@ void ImportRolesAction(COMMAND_T *) {
         w->ForceUpdateRgnSub();
         w->RefreshGUI();
       }
+      SyncSubtitleItemsTrack(false);
       MarkProjectDirty(NULL);
     } else
       MessageBox(GetMainHwnd(),

@@ -907,6 +907,7 @@ error:
 		IMPAPI(GetSetAutomationItemInfo);
 		IMPAPI(GetSetEnvelopeState);
 		IMPAPI(GetSetMediaItemInfo);
+		IMPAPI(GetSetMediaItemInfo_String);
 		IMPAPI(GetSetMediaItemTakeInfo);
 		IMPAPI(GetSetMediaItemTakeInfo_String);
 		IMPAPI(GetMediaSourceLength); // v5.0pre3+
