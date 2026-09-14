@@ -40,10 +40,19 @@
 
 #ifdef _WIN32
 #pragma comment(lib, "comctl32.lib")
+#include <winhttp.h>
+#include <urlmon.h>
+#pragma comment(lib, "winhttp.lib")
+#pragma comment(lib, "urlmon.lib")
+#else
+#include <thread>
 #endif
+
+#include "version.h"
 
 #include "SnM.h"
 #include "SnM_Dlg.h"
+#include "SnM_Misc.h"
 #include "SnM_Notes.h"
 #include "SnM_Project.h"
 #include "SnM_Track.h"
@@ -62,6 +71,8 @@
 #define NOTES_INI_SEC				"Notes"
 #define MAX_HELP_LENGTH				(64*1024) //JFB! instead of MAX_INI_SECTION (too large)
 #define UPDATE_TIMER				1
+#define ROLE_PROFILE_MSG_BASE		0xE000
+#define ROLE_PROFILE_MSG_COUNT		128
 
 enum {
   WRAP_MSG = 0xF001,
@@ -78,10 +89,16 @@ enum {
   ENABLE_ALL_MSG,
   DISABLE_ALL_MSG,
   COPY_MARKERS_MSG,
+  COPY_MARKERS_WITH_FRAMES_MSG,
+  TIME_FORMAT_NO_FRAMES_MSG,
+  TIME_FORMAT_FRAMES_MSG,
+  TIME_FORMAT_MS_MSG,
   COPY_ROLE_DISTRIBUTION_MSG,
   COPY_CURRENT_PHRASE_MSG,
   SELECT_LINKED_ACTOR_ROLES_MSG,
   CREATE_SUBTITLE_ITEMS_TRACK_MSG,
+  CHECK_RENOTES_UPDATES_MSG,
+  AUTO_CHECK_UPDATES_MSG,
   LAST_MSG // keep as last item!
 };
 
@@ -119,8 +136,23 @@ bool g_coloredRegions = true;
 bool g_displayActorInPrefix = true;
 bool g_hideRegions = false;
 bool g_hideActorList = false;
+enum SnM_TimeFormat {
+  SNM_TIME_FORMAT_NO_FRAMES = 0,
+  SNM_TIME_FORMAT_FRAMES = 1,
+  SNM_TIME_FORMAT_MS = 2
+};
+int g_copyTimeFormat = SNM_TIME_FORMAT_NO_FRAMES;
+bool g_autoCheckUpdates = true;
 static bool g_pendingRegionRecreation = false;
 SWSProjConfig<WDL_PtrList_DOD<SNM_Actor> > g_importedRoleActors;
+SWSProjConfig<WDL_FastString> g_activeRoleProfile;
+
+struct RoleProfileMenuEntry {
+  std::string name;
+  std::string path;
+};
+
+static std::vector<RoleProfileMenuEntry> g_roleProfileMenuEntries;
 
 void CleanupStaleActors();
 void ClearAllSubtitles();
@@ -129,6 +161,10 @@ void HideAllRegions();
 void ShowAllRegions();
 bool ExportRolesFile(const char *fn);
 bool ImportRolesFile(const char *fn);
+static bool LoadRolesFile(const char *fn);
+static bool ImportRoleProfile(const char *name, const char *path);
+static bool SaveActiveRoleProfile();
+static void RefreshRoleProfileEntries();
 void SyncSubtitleItemsTrack(bool createIfMissing);
 
 int g_notesType = -1;
@@ -187,6 +223,9 @@ NotesWnd::~NotesWnd() = default;
 
 void NotesWnd::OnInitDlg()
 {
+	SNM_SetIntConfigVar("projtimemode", 5);
+	UpdateTimeline();
+
 	m_edit = GetDlgItem(m_hwnd, IDC_EDIT1);
 	HWND edit2 = GetDlgItem(m_hwnd, IDC_EDIT2);
 
@@ -479,6 +518,22 @@ void RecreateActorRegions(const char *actorName) {
   for (int i = 0; i < subs->GetSize(); i++) {
     SNM_RegionSubtitle *sub = subs->Get(i);
     if (!strcmp(sub->GetActor(), actorName) && !sub->IsValid()) {
+      int enumIdx = 0;
+      bool isRgn = false;
+      double rStart = 0.0, rEnd = 0.0;
+      const char *rName = NULL;
+      int rNum = 0;
+      bool alreadyExists = false;
+      while ((enumIdx = EnumProjectMarkers2(NULL, enumIdx, &isRgn, &rStart, &rEnd, &rName, &rNum))) {
+        if (isRgn && fabs(rStart - sub->GetStartTime()) < 0.005 && fabs(rEnd - sub->GetEndTime()) < 0.005) {
+          sub->SetId(MakeMarkerRegionId(rNum, true));
+          alreadyExists = true;
+          break;
+        }
+      }
+      if (alreadyExists)
+        continue;
+
       int color = g_coloredRegions ? actor->GetEffectiveColor() : 0;
       WDL_String regionName;
       BuildRegionName(&regionName, sub->GetActor(), sub->GetNotes());
@@ -718,16 +773,81 @@ void UpdateRegionColors() {
   UpdateTimeline();
 }
 
-static void FormatSubTime(double seconds, char *buf, int bufSize) {
-  int totalSec = (int) (seconds + 0.5);
-  int h = totalSec / 3600;
-  int m = (totalSec % 3600) / 60;
-  int s = totalSec % 60;
-  if (h > 0)
-    snprintf(buf, bufSize, "%d:%02d:%02d", h, m, s);
-  else
-    snprintf(buf, bufSize, "%d:%02d", m, s);
+static void FormatSubTime(double seconds, char *buf, int bufSize, int formatOverride = -1) {
+  int mode = (formatOverride >= 0) ? formatOverride : g_copyTimeFormat;
+
+  if (mode == SNM_TIME_FORMAT_MS) {
+    int total_ms = (int)floor(seconds * 1000.0 + 0.5);
+    int ms = total_ms % 1000;
+    int total_s = total_ms / 1000;
+    int s = total_s % 60;
+    int total_m = total_s / 60;
+    int m = total_m % 60;
+    int h = total_m / 60;
+    if (h > 0)
+      snprintf(buf, bufSize, "%d:%02d:%02d.%03d", h, m, s, ms);
+    else
+      snprintf(buf, bufSize, "%d:%02d.%03d", m, s, ms);
+    return;
+  }
+
+  char raw[64] = "";
+  format_timestr_pos(seconds, raw, sizeof(raw), 5);
+
+  int tokens[8] = {0};
+  int tokenCount = 0;
+  const char *p = raw;
+  while (*p && tokenCount < 8) {
+    while (*p && !isdigit((unsigned char)*p)) p++;
+    if (*p && isdigit((unsigned char)*p)) {
+      char *next = NULL;
+      tokens[tokenCount++] = (int)strtol(p, &next, 10);
+      p = next;
+    }
+  }
+
+  int h = 0, m = 0, s = 0, f = 0;
+  if (tokenCount >= 4) {
+    h = tokens[0];
+    m = tokens[1];
+    s = tokens[2];
+    f = tokens[3];
+  } else if (tokenCount == 3) {
+    if (seconds >= 3600.0) {
+      h = tokens[0];
+      m = tokens[1];
+      s = tokens[2];
+      f = 0;
+    } else {
+      h = 0;
+      m = tokens[0];
+      s = tokens[1];
+      f = tokens[2];
+    }
+  } else if (tokenCount == 2) {
+    h = 0;
+    m = tokens[0];
+    s = tokens[1];
+    f = 0;
+  } else {
+    lstrcpyn(buf, raw, bufSize);
+    return;
+  }
+
+  if (mode == SNM_TIME_FORMAT_FRAMES) {
+    if (h > 0)
+      snprintf(buf, bufSize, "%d:%02d:%02d(%02d)", h, m, s, f);
+    else
+      snprintf(buf, bufSize, "%d:%02d(%02d)", m, s, f);
+  } else {
+    // Default: SNM_TIME_FORMAT_NO_FRAMES (0)
+    if (h > 0)
+      snprintf(buf, bufSize, "%d:%02d:%02d", h, m, s);
+    else
+      snprintf(buf, bufSize, "%d:%02d", m, s);
+  }
 }
+
 
 struct MarkerEntry {
   double pos;
@@ -830,7 +950,7 @@ static void CopyMarkersToClipboardLegacy(HWND hwnd) {
     }
     for (int j = 0; j < grp->GetSize(); j++) {
       SubEntry *e = grp->Get(j);
-      char startBuf[32], endBuf[32];
+      char startBuf[64], endBuf[64];
       FormatSubTime(e->startTime, startBuf, sizeof(startBuf));
       FormatSubTime(e->endTime, endBuf, sizeof(endBuf));
 
@@ -914,6 +1034,7 @@ struct ClipboardTextEntry {
   double end;
   std::string text;
   std::string group;
+  std::string role;
 };
 
 struct ClipboardTextGroup {
@@ -947,7 +1068,23 @@ static std::string FlattenClipboardText(const char *source) {
   return result;
 }
 
-static void CopyMarkersToClipboard(HWND hwnd) {
+static void CopyMarkersToClipboard(HWND hwnd, int formatOverride = -1) {
+  SNM_SetIntConfigVar("projtimemode", 5);
+  UpdateTimeline();
+
+  WDL_PtrList_DOD<SNM_Actor> *actorsList = g_actors.Get();
+  bool hasAnyActor = (actorsList && actorsList->GetSize() > 0);
+  bool anyActorEnabled = false;
+  bool hasDisabledActor = false;
+  if (hasAnyActor) {
+    for (int i = 0; i < actorsList->GetSize(); i++) {
+      if (actorsList->Get(i)->IsEnabled())
+        anyActorEnabled = true;
+      else
+        hasDisabledActor = true;
+    }
+  }
+
   std::vector<ClipboardMarkerEntry> markers;
   std::vector<ClipboardRegionEntry> regions;
   int enumIndex = 0;
@@ -969,39 +1106,78 @@ static void CopyMarkersToClipboard(HWND hwnd) {
   for (const ClipboardRegionEntry &region : regions) {
     std::vector<const ClipboardMarkerEntry *> insideMarkers;
     for (const ClipboardMarkerEntry &marker : markers) {
-      if (marker.position >= region.start && marker.position < region.end)
+      if (marker.position >= region.start - 0.05 && marker.position <= region.end + 0.05)
         insideMarkers.push_back(&marker);
     }
+    if (insideMarkers.empty())
+      continue;
+
     SNM_RegionSubtitle *subtitle = NULL;
     const int regionId = MakeMarkerRegionId(region.number, true);
     for (int i = 0; i < subtitles->GetSize(); i++) {
       SNM_RegionSubtitle *candidate = subtitles->Get(i);
-      if (candidate && candidate->IsValid() && candidate->GetId() == regionId) {
+      if (candidate && candidate->IsValid() && candidate->GetId() == regionId &&
+          candidate->GetActor() && candidate->GetActor()[0]) {
         subtitle = candidate;
         break;
       }
     }
-
-    std::string text = FlattenClipboardText(
-      subtitle ? subtitle->GetNotes() : region.text.c_str());
-    if (text.empty())
-      continue;
-    for (const ClipboardMarkerEntry *marker : insideMarkers) {
-      std::string markerText = FlattenClipboardText(marker->text.c_str());
-      if (!markerText.empty()) {
-        text.append(" (");
-        text.append(markerText);
-        text.push_back(')');
+    if (!subtitle) {
+      for (int i = 0; i < subtitles->GetSize(); i++) {
+        SNM_RegionSubtitle *candidate = subtitles->Get(i);
+        if (candidate && candidate->GetActor() && candidate->GetActor()[0] &&
+            fabs(candidate->GetStartTime() - region.start) < 0.005 &&
+            fabs(candidate->GetEndTime() - region.end) < 0.005) {
+          subtitle = candidate;
+          break;
+        }
       }
     }
 
-    std::string group;
-    if (subtitle) {
-      SNM_Actor *actor = FindActor(subtitle->GetActor());
-      if (actor && actor->HasLinkedActor())
-        group = actor->GetLinkedActorName();
+    SNM_Actor *subActor = NULL;
+    if (subtitle && subtitle->GetActor() && subtitle->GetActor()[0] && strcmp(subtitle->GetActor(), "?") != 0) {
+      subActor = FindActor(subtitle->GetActor());
     }
-    entries.push_back({region.start, region.end, text, group});
+
+    std::string role;
+    std::string group;
+    std::string text;
+
+    if (subActor) {
+      // Subtitle region with an associated actor
+      if (anyActorEnabled && !subActor->IsEnabled())
+        continue;
+
+      role = subActor->GetName();
+      if (subActor->HasLinkedActor())
+        group = subActor->GetLinkedActorName();
+      text = FlattenClipboardText(subtitle->GetNotes());
+    } else {
+      // Personal user region: separate structure, always copied, no actor/role grouping
+      text = FlattenClipboardText(region.text.c_str());
+    }
+
+    for (const ClipboardMarkerEntry *marker : insideMarkers) {
+      std::string markerText = FlattenClipboardText(marker->text.c_str());
+      if (!markerText.empty()) {
+        if (!text.empty()) {
+          text.append(" (");
+          text.append(markerText);
+          text.push_back(')');
+        } else {
+          text = markerText;
+        }
+      }
+    }
+
+    if (text.empty()) {
+      if (!region.text.empty())
+        text = FlattenClipboardText(region.text.c_str());
+      else
+        text = "Регион " + std::to_string(region.number);
+    }
+
+    entries.push_back({region.start, region.end, text, group, role});
   }
 
   std::sort(entries.begin(), entries.end(), [](const ClipboardTextEntry &a,
@@ -1047,14 +1223,29 @@ static void CopyMarkersToClipboard(HWND hwnd) {
     sortByTime(group.entries);
 
   WDL_FastString output;
-  auto appendEntries = [&output](const std::vector<ClipboardTextEntry> &items) {
+  auto appendEntries = [&output, formatOverride](const std::vector<ClipboardTextEntry> &items) {
     for (const ClipboardTextEntry &entry : items) {
-      char startBuffer[32];
-      char endBuffer[32];
-      FormatSubTime(entry.start, startBuffer, sizeof(startBuffer));
-      FormatSubTime(entry.end, endBuffer, sizeof(endBuffer));
-      output.AppendFormatted(512, "%s-%s %s\n", startBuffer, endBuffer,
-                             entry.text.c_str());
+      char startBuffer[64];
+      char endBuffer[64];
+      FormatSubTime(entry.start, startBuffer, sizeof(startBuffer), formatOverride);
+      FormatSubTime(entry.end, endBuffer, sizeof(endBuffer), formatOverride);
+
+      if (!entry.role.empty()) {
+        if (!entry.text.empty()) {
+          output.AppendFormatted(512, "%s-%s (%s) %s\n", startBuffer, endBuffer,
+                                 entry.role.c_str(), entry.text.c_str());
+        } else {
+          output.AppendFormatted(512, "%s-%s (%s)\n", startBuffer, endBuffer,
+                                 entry.role.c_str());
+        }
+      } else {
+        if (!entry.text.empty()) {
+          output.AppendFormatted(512, "%s-%s %s\n", startBuffer, endBuffer,
+                                 entry.text.c_str());
+        } else {
+          output.AppendFormatted(512, "%s-%s\n", startBuffer, endBuffer);
+        }
+      }
     }
   };
 
@@ -1072,7 +1263,7 @@ static void CopyMarkersToClipboard(HWND hwnd) {
     CF_SetClipboard(output.Get());
   else
     MessageBox(hwnd,
-               __LOCALIZE("Нет регионов с текстом.", "sws_DLG_152"),
+               __LOCALIZE("Нет маркеров внутри регионов.", "sws_DLG_152"),
                __LOCALIZE("ReNotes", "sws_DLG_152"),
                MB_OK);
 }
@@ -1129,6 +1320,26 @@ static WDL_DLGRET LinkActorDlgProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARA
 
 void NotesWnd::OnCommand(WPARAM wParam, LPARAM lParam)
 {
+	const int command = LOWORD(wParam);
+	if (command >= ROLE_PROFILE_MSG_BASE &&
+	    command < ROLE_PROFILE_MSG_BASE + (int)g_roleProfileMenuEntries.size()) {
+		const RoleProfileMenuEntry &profile =
+		  g_roleProfileMenuEntries[command - ROLE_PROFILE_MSG_BASE];
+		if (ImportRoleProfile(profile.name.c_str(), profile.path.c_str())) {
+			UpdateRegionColors();
+			RefreshActorList();
+			ForceUpdateRgnSub();
+			RefreshGUI();
+			SyncSubtitleItemsTrack(false);
+			MarkProjectDirty(NULL);
+		} else {
+			MessageBox(m_hwnd,
+			           __LOCALIZE("Не удалось импортировать профиль ролёвки.", "sws_DLG_152"),
+			           __LOCALIZE("ReNotes - Ошибка", "sws_DLG_152"),
+			           MB_OK);
+		}
+		return;
+	}
 	switch (LOWORD(wParam))
 	{
 		case IDC_EDIT1:
@@ -1174,6 +1385,27 @@ void NotesWnd::OnCommand(WPARAM wParam, LPARAM lParam)
       break;
     case COPY_MARKERS_MSG:
       CopyMarkersToClipboard(GetHWND());
+      break;
+    case COPY_MARKERS_WITH_FRAMES_MSG:
+      CopyMarkersToClipboard(GetHWND(), SNM_TIME_FORMAT_FRAMES);
+      break;
+    case TIME_FORMAT_NO_FRAMES_MSG:
+      g_copyTimeFormat = SNM_TIME_FORMAT_NO_FRAMES;
+      WritePrivateProfileString(NOTES_INI_SEC, "CopyTimeFormat", "0", g_SNM_IniFn.Get());
+      break;
+    case TIME_FORMAT_FRAMES_MSG:
+      g_copyTimeFormat = SNM_TIME_FORMAT_FRAMES;
+      WritePrivateProfileString(NOTES_INI_SEC, "CopyTimeFormat", "1", g_SNM_IniFn.Get());
+      break;
+    case TIME_FORMAT_MS_MSG:
+      g_copyTimeFormat = SNM_TIME_FORMAT_MS;
+      WritePrivateProfileString(NOTES_INI_SEC, "CopyTimeFormat", "2", g_SNM_IniFn.Get());
+      break;
+    case CHECK_RENOTES_UPDATES_MSG:
+      CheckReNotesUpdates(true);
+      break;
+    case AUTO_CHECK_UPDATES_MSG:
+      ToggleAutoCheckUpdatesAction(NULL);
       break;
     case COPY_CURRENT_PHRASE_MSG: {
       if (m_overlappingRegionIds.GetSize() <= 0) break;
@@ -1300,6 +1532,7 @@ void NotesWnd::OnCommand(WPARAM wParam, LPARAM lParam)
           UpdateRegionColors();
           RefreshActorList();
           SyncSubtitleItemsTrack(false);
+          SaveActiveRoleProfile();
           MarkProjectDirty(NULL);
         }
       }
@@ -1312,6 +1545,7 @@ void NotesWnd::OnCommand(WPARAM wParam, LPARAM lParam)
         UpdateRegionColors();
         RefreshActorList();
         SyncSubtitleItemsTrack(false);
+        SaveActiveRoleProfile();
         MarkProjectDirty(NULL);
       }
       break;
@@ -1359,6 +1593,7 @@ void NotesWnd::OnCommand(WPARAM wParam, LPARAM lParam)
           UpdateRegionColors();
           RefreshActorList();
           SyncSubtitleItemsTrack(false);
+          SaveActiveRoleProfile();
           MarkProjectDirty(NULL);
         }
       }
@@ -1373,6 +1608,8 @@ void NotesWnd::OnCommand(WPARAM wParam, LPARAM lParam)
           break;
         }
       }
+      if (!hasData && g_importedRoleActors.Get()->GetSize() > 0)
+        hasData = true;
       if (!hasData) {
         MessageBox(m_hwnd,
                    __LOCALIZE("Ничего не найдено для экспорта.", "sws_DLG_152"),
@@ -1381,6 +1618,7 @@ void NotesWnd::OnCommand(WPARAM wParam, LPARAM lParam)
         break;
       }
       char fn[SNM_MAX_PATH] = "";
+      SaveActiveRoleProfile();
       if (BrowseForSaveFile(
         __LOCALIZE("ReNotes - Экспортировать ролёвку", "sws_DLG_152"),
         g_lastRolesFn,
@@ -1440,7 +1678,7 @@ HMENU NotesWnd::OnContextMenu(int x, int y, bool* wantDefaultItems)
     RECT listRect;
     GetWindowRect(listHwnd, &listRect);
     POINT pt = {x, y};
-    if (PtInRect(&listRect, pt) && g_actors.Get()->GetSize() > 0) {
+    if (PtInRect(&listRect, pt)) {
       int iCol;
       SWS_ListItem *hitItem = m_actorListView->GetHitItem(x, y, &iCol);
       if (hitItem) {
@@ -1485,11 +1723,36 @@ HMENU NotesWnd::OnContextMenu(int x, int y, bool* wantDefaultItems)
                 -1,
                 false);
       AddToMenu(hMenu, SWS_SEPARATOR, 0);
-      AddToMenu(hMenu,
-                __LOCALIZE("Импортировать ролёвку\tCtrl+Shift+I", "sws_DLG_152"),
+      HMENU importMenu = CreatePopupMenu();
+      RefreshRoleProfileEntries();
+      if (g_roleProfileMenuEntries.empty()) {
+        AddToMenu(importMenu,
+                  __LOCALIZE("Нет сохранённых проектов", "sws_DLG_152"),
+                  0,
+                  -1,
+                  false,
+                  MF_GRAYED);
+      } else {
+        for (size_t i = 0; i < g_roleProfileMenuEntries.size(); i++) {
+          const bool active = g_activeRoleProfile.Get()->GetLength() &&
+            !_stricmp(g_activeRoleProfile.Get()->Get(), g_roleProfileMenuEntries[i].name.c_str());
+          AddToMenu(importMenu,
+                    g_roleProfileMenuEntries[i].name.c_str(),
+                    ROLE_PROFILE_MSG_BASE + (int)i,
+                    -1,
+                    false,
+                    active ? MFS_CHECKED : MFS_UNCHECKED);
+        }
+        AddToMenu(importMenu, SWS_SEPARATOR, 0);
+      }
+      AddToMenu(importMenu,
+                __LOCALIZE("Из файла...\tCtrl+Shift+I", "sws_DLG_152"),
                 IMPORT_ROLES_MSG,
                 -1,
                 false);
+      AddSubMenu(hMenu,
+                 importMenu,
+                 __LOCALIZE("Импортировать ролёвку", "sws_DLG_152"));
       AddToMenu(hMenu,
                 __LOCALIZE("Экспортировать ролёвку\tCtrl+Shift+E", "sws_DLG_152"),
                 EXPORT_ROLES_MSG,
@@ -1516,6 +1779,32 @@ HMENU NotesWnd::OnContextMenu(int x, int y, bool* wantDefaultItems)
               COPY_MARKERS_MSG,
               -1,
               false);
+
+    HMENU timeFormatMenu = CreatePopupMenu();
+    AddToMenu(timeFormatMenu,
+              __LOCALIZE("Без кадров (16:17 / 1:16:17)", "sws_DLG_152"),
+              TIME_FORMAT_NO_FRAMES_MSG,
+              -1,
+              false);
+    AddToMenu(timeFormatMenu,
+              __LOCALIZE("С кадрами (16:17(27) / 1:16:17(27))", "sws_DLG_152"),
+              TIME_FORMAT_FRAMES_MSG,
+              -1,
+              false);
+    AddToMenu(timeFormatMenu,
+              __LOCALIZE("С миллисекундами (16:22.504 / 1:16:22.504)", "sws_DLG_152"),
+              TIME_FORMAT_MS_MSG,
+              -1,
+              false);
+
+    CheckMenuItem(timeFormatMenu, TIME_FORMAT_NO_FRAMES_MSG, MF_BYCOMMAND | (g_copyTimeFormat == SNM_TIME_FORMAT_NO_FRAMES ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(timeFormatMenu, TIME_FORMAT_FRAMES_MSG, MF_BYCOMMAND | (g_copyTimeFormat == SNM_TIME_FORMAT_FRAMES ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(timeFormatMenu, TIME_FORMAT_MS_MSG, MF_BYCOMMAND | (g_copyTimeFormat == SNM_TIME_FORMAT_MS ? MF_CHECKED : MF_UNCHECKED));
+
+    AddSubMenu(hMenu,
+               timeFormatMenu,
+               __LOCALIZE("Формат времени маркеров", "sws_DLG_152"));
+
     AddToMenu(hMenu,
               __LOCALIZE("Создать дорожку с репликами", "sws_DLG_152"),
               CREATE_SUBTITLE_ITEMS_TRACK_MSG,
@@ -1557,6 +1846,21 @@ HMENU NotesWnd::OnContextMenu(int x, int y, bool* wantDefaultItems)
 
   if (g_notesType == SNM_NOTES_GLOBAL)
     AddToMenu(hMenu, __LOCALIZE("Сохранить глобальные заметки", "sws_DLG_152"), SAVE_GLOBAL_NOTES_MSG, -1, false);
+
+  AddToMenu(hMenu, SWS_SEPARATOR, 0);
+  AddToMenu(hMenu,
+            __LOCALIZE("Проверить обновления ReNotes...", "sws_DLG_152"),
+            CHECK_RENOTES_UPDATES_MSG,
+            -1,
+            false);
+  AddToMenu(hMenu,
+            __LOCALIZE("Автоматически проверять обновления", "sws_DLG_152"),
+            AUTO_CHECK_UPDATES_MSG,
+            -1,
+            false);
+  if (g_autoCheckUpdates)
+    CheckMenuItem(hMenu, AUTO_CHECK_UPDATES_MSG, MF_BYCOMMAND | MF_CHECKED);
+
   return hMenu;
 }
 
@@ -1593,6 +1897,7 @@ int NotesWnd::OnKey(MSG* _msg, int _iKeyState)
           case 'R':       OnCommand(COPY_ROLE_DISTRIBUTION_MSG, 0); return 1;
           case 'A':       OnCommand(ENABLE_ALL_MSG, 0);             return 1;
           case 'D':       OnCommand(DISABLE_ALL_MSG, 0);            return 1;
+          case 'M':       OnCommand(COPY_MARKERS_WITH_FRAMES_MSG, 0); return 1;
         }
       }
       if (_iKeyState == LVKF_CONTROL) {
@@ -2796,6 +3101,34 @@ int SNM_Actor::GetEffectiveColor() const {
   return m_color;
 }
 
+static SNM_Actor *FindActorInList(WDL_PtrList_DOD<SNM_Actor> *actors, const char *name) {
+  for (int i = 0; i < actors->GetSize(); i++)
+    if (!strcmp(actors->Get(i)->GetName(), name))
+      return actors->Get(i);
+  return NULL;
+}
+
+static void CopyRoleState(SNM_Actor *target, const SNM_Actor *source) {
+  target->SetLinkedActorName(source->GetLinkedActorName());
+  target->SetColor(source->GetColor());
+  target->SetHasCustomColor(source->HasCustomColor());
+}
+
+static void UpdateRoleMemory(const SNM_Actor *actor) {
+  WDL_PtrList_DOD<SNM_Actor> *memory = g_importedRoleActors.Get();
+  SNM_Actor *saved = FindActorInList(memory, actor->GetName());
+  if (!actor->HasLinkedActor() && !actor->HasCustomColor()) {
+    if (saved)
+      memory->Delete(memory->Find(saved), true);
+    return;
+  }
+  if (!saved) {
+    saved = new SNM_Actor(actor->GetName(), actor->GetColor());
+    memory->Add(saved);
+  }
+  CopyRoleState(saved, actor);
+}
+
 SNM_Actor *FindOrCreateActor(const char *name) {
   WDL_PtrList_DOD<SNM_Actor> *actors = g_actors.Get();
   for (int i = 0; i < actors->GetSize(); i++)
@@ -2803,6 +3136,8 @@ SNM_Actor *FindOrCreateActor(const char *name) {
       return actors->Get(i);
   int color = strcmp(name, "?") ? GenerateActorColor(name) : 0;
   SNM_Actor *actor = new SNM_Actor(name, color);
+  if (SNM_Actor *saved = FindActorInList(g_importedRoleActors.Get(), name))
+    CopyRoleState(actor, saved);
   actors->Add(actor);
   return actor;
 }
@@ -3489,6 +3824,101 @@ void NotesWnd::OnDroppedFiles(HDROP h) {
   DragFinish(h);
 }
 
+static std::string RoleProfileNameFromPath(const char *path) {
+  const char *leaf = path ? path : "";
+  for (const char *p = leaf; *p; p++)
+    if (*p == '/' || *p == '\\')
+      leaf = p + 1;
+  std::string name(leaf);
+  const size_t dot = name.find_last_of('.');
+  if (dot != std::string::npos)
+    name.erase(dot);
+  if (name.empty())
+    name = "Без имени";
+  for (size_t i = 0; i < name.size(); i++) {
+    unsigned char c = (unsigned char)name[i];
+    if (c < 32 || strchr("<>:\"/\\|?*", c))
+      name[i] = '_';
+  }
+  return name;
+}
+
+static std::string CurrentProjectRoleProfileName() {
+  char projectPath[SNM_MAX_PATH] = "";
+  EnumProjects(-1, projectPath, sizeof(projectPath));
+  return RoleProfileNameFromPath(projectPath);
+}
+
+static WDL_FastString RoleProfilesDirectory(bool create) {
+  WDL_FastString dir(GetResourcePath());
+  dir.Append(WDL_DIRCHAR_STR "ReNotesRoles");
+  if (create)
+    CreateDirectory(dir.Get(), NULL);
+  return dir;
+}
+
+static WDL_FastString RoleProfilePath(const char *name, bool createDirectory) {
+  WDL_FastString path(RoleProfilesDirectory(createDirectory).Get());
+  path.Append(WDL_DIRCHAR_STR);
+  path.Append(name);
+  path.Append(".roles");
+  return path;
+}
+
+static void RefreshRoleProfileEntries() {
+  g_roleProfileMenuEntries.clear();
+  WDL_FastString directory(RoleProfilesDirectory(false).Get());
+  WDL_DirScan scan;
+#ifdef _WIN32
+  WDL_FastString search(directory.Get());
+  search.Append(WDL_DIRCHAR_STR "*.roles");
+  int result = scan.First(search.Get(), true);
+#else
+  int result = scan.First(directory.Get());
+#endif
+  if (result == 0) {
+    do {
+      std::string fileName(scan.GetCurrentFN());
+      if (fileName.size() <= 6 || _stricmp(fileName.c_str() + fileName.size() - 6, ".roles"))
+        continue;
+      RoleProfileMenuEntry profile;
+      profile.name.assign(fileName, 0, fileName.size() - 6);
+      WDL_FastString path(directory.Get());
+      path.Append(WDL_DIRCHAR_STR);
+      path.Append(fileName.c_str());
+      profile.path = path.Get();
+      g_roleProfileMenuEntries.push_back(profile);
+    } while (!scan.Next() && g_roleProfileMenuEntries.size() < ROLE_PROFILE_MSG_COUNT);
+  }
+  std::sort(g_roleProfileMenuEntries.begin(), g_roleProfileMenuEntries.end(),
+            [](const RoleProfileMenuEntry &a, const RoleProfileMenuEntry &b) {
+              return _stricmp(a.name.c_str(), b.name.c_str()) < 0;
+            });
+}
+
+static void MergeCurrentRolesIntoMemory() {
+  WDL_PtrList_DOD<SNM_Actor> *actors = g_actors.Get();
+  for (int i = 0; i < actors->GetSize(); i++)
+    UpdateRoleMemory(actors->Get(i));
+}
+
+static bool SaveActiveRoleProfile() {
+  if (!g_activeRoleProfile.Get()->GetLength())
+    g_activeRoleProfile.Get()->Set(CurrentProjectRoleProfileName().c_str());
+  MergeCurrentRolesIntoMemory();
+  if (!g_importedRoleActors.Get()->GetSize())
+    return false;
+  WDL_FastString path(RoleProfilePath(g_activeRoleProfile.Get()->Get(), true).Get());
+  return ExportRolesFile(path.Get());
+}
+
+static bool ImportRoleProfile(const char *name, const char *path) {
+  if (!LoadRolesFile(path))
+    return false;
+  g_activeRoleProfile.Get()->Set(name);
+  return true;
+}
+
 bool ExportRolesFile(const char*fn) {
   WDL_PtrList_DOD<SNM_Actor> *actors = g_actors.Get();
 
@@ -3569,7 +3999,7 @@ bool ExportRolesFile(const char*fn) {
 			return true;
 		}
 
-bool ImportRolesFile(const char *fn) {
+static bool LoadRolesFile(const char *fn) {
   FILE *f = fopenUTF8(fn, "rt");
   if (!f)
     return false;
@@ -3587,26 +4017,25 @@ bool ImportRolesFile(const char *fn) {
 			{
 				for (int i=0; i < charNames.GetSize(); i++) {
         const char *charName = charNames.Get(i)->Get();
-        SNM_Actor *a = FindOrCreateActor(charName);
-        a->SetLinkedActorName(sectionName.Get());
-        if (hasColor) {
-          a->SetColor(parsedColor);
-          a->SetHasCustomColor(true);
-	}
         SNM_Actor *ia = new SNM_Actor(charName,
                                       hasColor ? parsedColor : GenerateActorColor(charName));
         ia->SetLinkedActorName(sectionName.Get());
         if (hasColor) ia->SetHasCustomColor(true);
+        if (SNM_Actor *old = FindActorInList(g_importedRoleActors.Get(), charName))
+          g_importedRoleActors.Get()->Delete(g_importedRoleActors.Get()->Find(old), true);
         g_importedRoleActors.Get()->Add(ia);
+        if (SNM_Actor *a = FindActorInList(g_actors.Get(), charName))
+          CopyRoleState(a, ia);
       }
     } else if (sectionType == SECTION_CHARACTER) {
-      SNM_Actor *a = FindOrCreateActor(sectionName.Get());
       if (hasColor) {
-        a->SetColor(parsedColor);
-        a->SetHasCustomColor(true);
         SNM_Actor *ia = new SNM_Actor(sectionName.Get(), parsedColor);
         ia->SetHasCustomColor(true);
+        if (SNM_Actor *old = FindActorInList(g_importedRoleActors.Get(), sectionName.Get()))
+          g_importedRoleActors.Get()->Delete(g_importedRoleActors.Get()->Find(old), true);
         g_importedRoleActors.Get()->Add(ia);
+        if (SNM_Actor *a = FindActorInList(g_actors.Get(), sectionName.Get()))
+          CopyRoleState(a, ia);
       }
     }
   };
@@ -3700,6 +4129,14 @@ bool ImportRolesFile(const char *fn) {
 			return true;
 		}
 
+bool ImportRolesFile(const char *fn) {
+  const std::string profileName = RoleProfileNameFromPath(fn);
+  if (!ImportRoleProfile(profileName.c_str(), fn))
+    return false;
+  SaveActiveRoleProfile();
+  return true;
+}
+
 void ClearAllSubtitles()
 {
   WDL_PtrList_DOD<SNM_RegionSubtitle> *subs = g_pRegionSubs.Get();
@@ -3714,7 +4151,6 @@ void ClearAllSubtitles()
   subs->Empty(true);
 
   g_actors.Get()->Empty(true);
-  g_importedRoleActors.Get()->Empty(true);
 
   UpdateTimeline();
   MarkProjectDirty(NULL);
@@ -3756,7 +4192,20 @@ static bool ProcessExtensionLine(const char *line, ProjectStateContext *ctx, boo
 
 	ReaProject *p = GetCurrentProjectInLoadSave();
 
-	if (!strcmp(lp.gettoken_str(0), "<S&M_PROJNOTES"))
+	if (!strcmp(lp.gettoken_str(0), "<S&M_ROLE_PROFILE"))
+	{
+		char profileName[SNM_MAX_CHUNK_LINE_LENGTH] = "";
+		if (ctx->GetLine(profileName, sizeof(profileName)) >= 0 &&
+		    profileName[0] && strcmp(profileName, ">")) {
+			g_activeRoleProfile.Get()->Set(profileName);
+			WDL_FastString path(RoleProfilePath(profileName, false).Get());
+			LoadRolesFile(path.Get());
+			char closing[SNM_MAX_CHUNK_LINE_LENGTH] = "";
+			ctx->GetLine(closing, sizeof(closing));
+		}
+		return true;
+	}
+	else if (!strcmp(lp.gettoken_str(0), "<S&M_PROJNOTES"))
 	{
 		WDL_FastString notes;
 		ExtensionConfigToString(&notes, ctx);
@@ -3811,11 +4260,13 @@ static bool ProcessExtensionLine(const char *line, ProjectStateContext *ctx, boo
     }
 
     if (GetStringFromNotesChunk(&notes, buf, MAX_HELP_LENGTH)) {
-      SNM_RegionSubtitle *sub = new SNM_RegionSubtitle(p, id, buf);
-      sub->SetActor(actor);
-      if (isNewFormat)
-        sub->SetTimes(startTime, endTime);
-      g_pRegionSubs.Get()->Add(sub);
+      if (actor[0] != '\0') {
+        SNM_RegionSubtitle *sub = new SNM_RegionSubtitle(p, id, buf);
+        sub->SetActor(actor);
+        if (isNewFormat)
+          sub->SetTimes(startTime, endTime);
+        g_pRegionSubs.Get()->Add(sub);
+      }
     }
     return true;
   } else if (!strcmp(lp.gettoken_str(0), "<S&M_ACTOR")) {
@@ -3848,6 +4299,15 @@ static void SaveExtensionConfig(ProjectStateContext *ctx, bool isUndo, struct pr
 	char line[SNM_MAX_CHUNK_LINE_LENGTH] = "";
 	char strId[128] = "";
 	WDL_FastString formatedNotes;
+
+	if (!isUndo && IsActiveProjectInLoadSave() &&
+	    (g_actors.Get()->GetSize() || g_importedRoleActors.Get()->GetSize()))
+		SaveActiveRoleProfile();
+	if (g_activeRoleProfile.Get()->GetLength()) {
+		ctx->AddLine("<S&M_ROLE_PROFILE");
+		ctx->AddLine("%s", g_activeRoleProfile.Get()->Get());
+		ctx->AddLine(">");
+	}
 
 	// save project notes
 	if (g_prjNotes.Get()->GetLength())
@@ -3887,7 +4347,7 @@ static void SaveExtensionConfig(ProjectStateContext *ctx, bool isUndo, struct pr
 	{
 		if (SNM_RegionSubtitle* sub = g_pRegionSubs.Get()->Get(i))
 		{
-			if (!sub->GetNotesLength())
+			if (!sub->GetNotesLength() || !sub->GetActor() || !sub->GetActor()[0])
         continue;
       double startTime = sub->GetStartTime();
       double endTime = sub->GetEndTime();
@@ -3937,6 +4397,8 @@ static void BeginLoadProjectState(bool isUndo, struct project_config_extension_t
   g_actors.Get()->Empty(true);
   g_importedRoleActors.Cleanup();
   g_importedRoleActors.Get()->Empty(true);
+  g_activeRoleProfile.Cleanup();
+  g_activeRoleProfile.Get()->Set("");
 
 	// g_globalNotes is loaded in NotesInit()
 }
@@ -3980,6 +4442,20 @@ int NotesInit()
       (GetPrivateProfileInt(NOTES_INI_SEC, "DisplayActorInPrefix", 1, g_SNM_IniFn.Get()) == 1);
   g_hideRegions = (GetPrivateProfileInt(NOTES_INI_SEC, "HideRegions", 0, g_SNM_IniFn.Get()) == 1);
   g_hideActorList = (GetPrivateProfileInt(NOTES_INI_SEC, "HideActorList", 0, g_SNM_IniFn.Get()) == 1);
+  g_copyTimeFormat = GetPrivateProfileInt(NOTES_INI_SEC, "CopyTimeFormat", 0, g_SNM_IniFn.Get());
+  if (g_copyTimeFormat < 0 || g_copyTimeFormat > 2)
+    g_copyTimeFormat = 0;
+  g_autoCheckUpdates = (GetPrivateProfileInt(NOTES_INI_SEC, "AutoCheckUpdates", 1, g_SNM_IniFn.Get()) == 1);
+  if (g_autoCheckUpdates) {
+    int lastCheck = GetPrivateProfileInt(NOTES_INI_SEC, "LastUpdateCheck", 0, g_SNM_IniFn.Get());
+    time_t now = time(NULL);
+    if (lastCheck == 0 || (now > 0 && (now - lastCheck) > 24 * 3600)) {
+      char nowBuf[32] = "";
+      snprintf(nowBuf, sizeof(nowBuf), "%d", static_cast<int>(now));
+      WritePrivateProfileString(NOTES_INI_SEC, "LastUpdateCheck", nowBuf, g_SNM_IniFn.Get());
+      CheckReNotesUpdates(false);
+    }
+  }
 
 	// Read global notes from the ReNotes file, falling back to the legacy SWS filename.
 	WDL_FastString filePath;
@@ -4029,6 +4505,12 @@ void NotesExit()
   WritePrivateProfileString(NOTES_INI_SEC,
                             "HideActorList",
                             g_hideActorList ? "1" : "0", g_SNM_IniFn.Get());
+  char timeFmtBuf[4] = "";
+  if (snprintfStrict(timeFmtBuf, sizeof(timeFmtBuf), "%d", g_copyTimeFormat) > 0)
+    WritePrivateProfileString(NOTES_INI_SEC, "CopyTimeFormat", timeFmtBuf, g_SNM_IniFn.Get());
+  WritePrivateProfileString(NOTES_INI_SEC,
+                            "AutoCheckUpdates",
+                            g_autoCheckUpdates ? "1" : "0", g_SNM_IniFn.Get());
 
 	g_notesWndMgr.Delete();
 }
@@ -4077,12 +4559,29 @@ int IsColoredRegions(COMMAND_T *) {
   return g_coloredRegions;
 }
 
+void CleanOrphanSubs() {
+  WDL_PtrList_DOD<SNM_RegionSubtitle> *subs = g_pRegionSubs.Get();
+  for (int i = subs->GetSize() - 1; i >= 0; i--) {
+    SNM_RegionSubtitle *sub = subs->Get(i);
+    if (!sub) continue;
+    const char *act = sub->GetActor();
+    if (!act || !*act) {
+      subs->Delete(i, true);
+    }
+  }
+}
+
 void HideAllRegions() {
+  CleanOrphanSubs();
   WDL_PtrList_DOD<SNM_RegionSubtitle> *subs = g_pRegionSubs.Get();
   PreventUIRefresh(1);
   for (int i = 0; i < subs->GetSize(); i++) {
     SNM_RegionSubtitle *sub = subs->Get(i);
-    if (sub->IsValid()) {
+    if (sub && sub->IsValid()) {
+      const char *act = sub->GetActor();
+      if (!act || !*act)
+        continue;
+
       double pos, endPos;
       if (EnumMarkerRegionById(NULL, sub->GetId(), NULL, &pos, &endPos, NULL, NULL, NULL) >= 0)
         sub->SetTimes(pos, endPos);
@@ -4096,11 +4595,47 @@ void HideAllRegions() {
 }
 
 void ShowAllRegions() {
+  CleanOrphanSubs();
   WDL_PtrList_DOD<SNM_Actor> *actors = g_actors.Get();
   PreventUIRefresh(1);
   for (int i = 0; i < actors->GetSize(); i++) {
     if (actors->Get(i)->IsEnabled())
       RecreateActorRegions(actors->Get(i)->GetName());
+  }
+  WDL_PtrList_DOD<SNM_RegionSubtitle> *subs = g_pRegionSubs.Get();
+  for (int i = 0; i < subs->GetSize(); i++) {
+    SNM_RegionSubtitle *sub = subs->Get(i);
+    if (sub && !sub->IsValid()) {
+      const char *act = sub->GetActor();
+      if (act && *act && !strcmp(act, "?")) {
+        SNM_Actor *qActor = FindActor("?");
+        if (qActor && !qActor->IsEnabled())
+          continue;
+
+        int enumIdx = 0;
+        bool isRgn = false;
+        double rStart = 0.0, rEnd = 0.0;
+        const char *rName = NULL;
+        int rNum = 0;
+        bool alreadyExists = false;
+        while ((enumIdx = EnumProjectMarkers2(NULL, enumIdx, &isRgn, &rStart, &rEnd, &rName, &rNum))) {
+          if (isRgn && fabs(rStart - sub->GetStartTime()) < 0.005 && fabs(rEnd - sub->GetEndTime()) < 0.005) {
+            sub->SetId(MakeMarkerRegionId(rNum, true));
+            alreadyExists = true;
+            break;
+          }
+        }
+        if (alreadyExists)
+          continue;
+
+        int color = (g_coloredRegions && qActor) ? qActor->GetEffectiveColor() : 0;
+        WDL_String regionName;
+        BuildRegionName(&regionName, act, sub->GetNotes());
+        int num = AddProjectMarker2(NULL, true, sub->GetStartTime(), sub->GetEndTime(), regionName.Get(), -1, color);
+        if (num >= 0)
+          sub->SetId(MakeMarkerRegionId(num, true));
+      }
+    }
   }
   PreventUIRefresh(-1);
 }
@@ -4150,6 +4685,342 @@ int IsDisplayActorInPrefix(COMMAND_T *) {
 
 void CopyMarkersAction(COMMAND_T *) {
   CopyMarkersToClipboard(GetMainHwnd());
+}
+
+void CopyMarkersWithFramesAction(COMMAND_T *) {
+  CopyMarkersToClipboard(GetMainHwnd(), SNM_TIME_FORMAT_FRAMES);
+}
+
+void CopyMarkersNoFramesAction(COMMAND_T *) {
+  CopyMarkersToClipboard(GetMainHwnd(), SNM_TIME_FORMAT_NO_FRAMES);
+}
+
+void ToggleCopyFramesAction(COMMAND_T *) {
+  g_copyTimeFormat = (g_copyTimeFormat == SNM_TIME_FORMAT_FRAMES) ? SNM_TIME_FORMAT_NO_FRAMES : SNM_TIME_FORMAT_FRAMES;
+  char tmp[4] = "";
+  if (snprintfStrict(tmp, sizeof(tmp), "%d", g_copyTimeFormat) > 0)
+    WritePrivateProfileString(NOTES_INI_SEC, "CopyTimeFormat", tmp, g_SNM_IniFn.Get());
+}
+
+int IsCopyFramesAction(COMMAND_T *) {
+  return (g_copyTimeFormat == SNM_TIME_FORMAT_FRAMES) ? 1 : 0;
+}
+
+struct ReNotesUpdateState {
+  bool interactive;
+};
+
+static unsigned WINAPI ReNotesUpdateThreadProc(void *param)
+{
+  ReNotesUpdateState *st = reinterpret_cast<ReNotesUpdateState *>(param);
+  bool interactive = st ? st->interactive : false;
+  delete st;
+
+  int latestVersion = 0;
+  std::string tagName;
+  std::string htmlUrl = "https://github.com/ivangund/sws-renotes/releases";
+  std::string downloadUrl;
+  std::string json;
+
+#ifdef _WIN32
+  HINTERNET hSession = WinHttpOpen(L"Mozilla/5.0 (Windows NT 10.0; Win64; x64) ReNotes-Updater",
+                                   WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                                   WINHTTP_NO_PROXY_NAME,
+                                   WINHTTP_NO_PROXY_BYPASS, 0);
+  if (hSession) {
+    HINTERNET hConnect = WinHttpConnect(hSession, L"github.com", INTERNET_DEFAULT_HTTPS_PORT, 0);
+    if (hConnect) {
+      HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"GET",
+                                             L"/ivangund/sws-renotes/releases/latest",
+                                             NULL, WINHTTP_NO_REFERER,
+                                             WINHTTP_DEFAULT_ACCEPT_TYPES,
+                                             WINHTTP_FLAG_SECURE);
+      if (hRequest) {
+        DWORD redirectPolicy = WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
+        WinHttpSetOption(hRequest, WINHTTP_OPTION_REDIRECT_POLICY, &redirectPolicy, sizeof(redirectPolicy));
+
+        if (WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
+            WinHttpReceiveResponse(hRequest, NULL)) {
+          DWORD statusCode = 0;
+          DWORD statusSize = sizeof(statusCode);
+          if (WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                                  WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &statusSize, WINHTTP_NO_HEADER_INDEX)) {
+            if (statusCode == 301 || statusCode == 302) {
+              DWORD locSize = 0;
+              WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_LOCATION, WINHTTP_HEADER_NAME_BY_INDEX, NULL, &locSize, WINHTTP_NO_HEADER_INDEX);
+              if (locSize > 0) {
+                std::vector<wchar_t> locBuf(locSize / sizeof(wchar_t) + 1, 0);
+                if (WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_LOCATION, WINHTTP_HEADER_NAME_BY_INDEX, locBuf.data(), &locSize, WINHTTP_NO_HEADER_INDEX)) {
+                  int wlen = (int)wcslen(locBuf.data());
+                  int utf8Len = WideCharToMultiByte(CP_UTF8, 0, locBuf.data(), wlen, NULL, 0, NULL, NULL);
+                  if (utf8Len > 0) {
+                    std::string loc(utf8Len, 0);
+                    WideCharToMultiByte(CP_UTF8, 0, locBuf.data(), wlen, &loc[0], utf8Len, NULL, NULL);
+                    size_t tagPos = loc.rfind("/tag/");
+                    if (tagPos != std::string::npos) {
+                      tagName = loc.substr(tagPos + 5);
+                      htmlUrl = loc;
+                      const char *p = tagName.c_str();
+                      while (*p && !isdigit(static_cast<unsigned char>(*p))) p++;
+                      if (*p) latestVersion = atoi(p);
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+        WinHttpCloseHandle(hRequest);
+      }
+
+      if (!tagName.empty()) {
+        std::wstring assetsPath = L"/ivangund/sws-renotes/releases/expanded_assets/" + std::wstring(tagName.begin(), tagName.end());
+        HINTERNET hAssetReq = WinHttpOpenRequest(hConnect, L"GET",
+                                                assetsPath.c_str(),
+                                                NULL, WINHTTP_NO_REFERER,
+                                                WINHTTP_DEFAULT_ACCEPT_TYPES,
+                                                WINHTTP_FLAG_SECURE);
+        if (hAssetReq) {
+          if (WinHttpSendRequest(hAssetReq, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
+              WinHttpReceiveResponse(hAssetReq, NULL)) {
+            std::string assetHtml;
+            DWORD dwSize = 0;
+            while (WinHttpQueryDataAvailable(hAssetReq, &dwSize) && dwSize > 0) {
+              std::vector<char> buf(dwSize + 1, 0);
+              DWORD dwDownloaded = 0;
+              if (WinHttpReadData(hAssetReq, buf.data(), dwSize, &dwDownloaded) && dwDownloaded > 0) {
+                assetHtml.append(buf.data(), dwDownloaded);
+              } else {
+                break;
+              }
+            }
+            size_t exePos = assetHtml.find(".exe");
+            if (exePos != std::string::npos) {
+              size_t hrefStart = assetHtml.rfind("href=\"", exePos);
+              if (hrefStart != std::string::npos) {
+                hrefStart += 6;
+                std::string href = assetHtml.substr(hrefStart, exePos + 4 - hrefStart);
+                if (href.rfind("http", 0) == 0)
+                  downloadUrl = href;
+                else
+                  downloadUrl = "https://github.com" + href;
+              }
+            }
+          }
+          WinHttpCloseHandle(hAssetReq);
+        }
+      }
+
+      WinHttpCloseHandle(hConnect);
+    }
+
+    if (tagName.empty()) {
+      HINTERNET hApiConnect = WinHttpConnect(hSession, L"api.github.com", INTERNET_DEFAULT_HTTPS_PORT, 0);
+      if (hApiConnect) {
+        HINTERNET hApiReq = WinHttpOpenRequest(hApiConnect, L"GET",
+                                               L"/repos/ivangund/sws-renotes/releases/latest",
+                                               NULL, WINHTTP_NO_REFERER,
+                                               WINHTTP_DEFAULT_ACCEPT_TYPES,
+                                               WINHTTP_FLAG_SECURE);
+        if (hApiReq) {
+          WinHttpAddRequestHeaders(hApiReq,
+                                   L"User-Agent: ReNotes-Updater\r\nAccept: application/vnd.github.v3+json\r\n",
+                                   -1, WINHTTP_ADDREQ_FLAG_ADD);
+          if (WinHttpSendRequest(hApiReq, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
+              WinHttpReceiveResponse(hApiReq, NULL)) {
+            DWORD statusCode = 0;
+            DWORD statusSize = sizeof(statusCode);
+            if (WinHttpQueryHeaders(hApiReq, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                                    WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &statusSize, WINHTTP_NO_HEADER_INDEX) &&
+                statusCode == 200) {
+              DWORD dwSize = 0;
+              while (WinHttpQueryDataAvailable(hApiReq, &dwSize) && dwSize > 0) {
+                std::vector<char> buf(dwSize + 1, 0);
+                DWORD dwDownloaded = 0;
+                if (WinHttpReadData(hApiReq, buf.data(), dwSize, &dwDownloaded) && dwDownloaded > 0) {
+                  json.append(buf.data(), dwDownloaded);
+                } else {
+                  break;
+                }
+              }
+            }
+          }
+          WinHttpCloseHandle(hApiReq);
+        }
+        WinHttpCloseHandle(hApiConnect);
+      }
+    }
+
+    WinHttpCloseHandle(hSession);
+  }
+#else
+  FILE *pipe = popen("curl -s -L -I https://github.com/ivangund/sws-renotes/releases/latest | grep -i Location", "r");
+  if (pipe) {
+    char buf[512];
+    if (fgets(buf, sizeof(buf), pipe)) {
+      std::string line = buf;
+      size_t tagPos = line.rfind("/tag/");
+      if (tagPos != std::string::npos) {
+        tagName = line.substr(tagPos + 5);
+        while (!tagName.empty() && (tagName.back() == '\r' || tagName.back() == '\n' || tagName.back() == ' '))
+          tagName.pop_back();
+        htmlUrl = "https://github.com/ivangund/sws-renotes/releases/tag/" + tagName;
+        const char *p = tagName.c_str();
+        while (*p && !isdigit(static_cast<unsigned char>(*p))) p++;
+        if (*p) latestVersion = atoi(p);
+      }
+    }
+    pclose(pipe);
+  }
+#endif
+
+  if (!json.empty() && tagName.empty()) {
+    size_t tagPos = json.find("\"tag_name\"");
+    if (tagPos != std::string::npos) {
+      size_t colon = json.find(':', tagPos);
+      if (colon != std::string::npos) {
+        size_t q1 = json.find('\"', colon);
+        if (q1 != std::string::npos) {
+          size_t q2 = json.find('\"', q1 + 1);
+          if (q2 != std::string::npos) {
+            tagName = json.substr(q1 + 1, q2 - q1 - 1);
+            const char *p = tagName.c_str();
+            while (*p && !isdigit(static_cast<unsigned char>(*p))) p++;
+            if (*p) latestVersion = atoi(p);
+          }
+        }
+      }
+    }
+
+    size_t htmlPos = json.find("\"html_url\"");
+    if (htmlPos != std::string::npos) {
+      size_t colon = json.find(':', htmlPos);
+      if (colon != std::string::npos) {
+        size_t q1 = json.find('\"', colon);
+        if (q1 != std::string::npos) {
+          size_t q2 = json.find('\"', q1 + 1);
+          if (q2 != std::string::npos) {
+            htmlUrl = json.substr(q1 + 1, q2 - q1 - 1);
+          }
+        }
+      }
+    }
+
+    if (downloadUrl.empty()) {
+      size_t assetPos = 0;
+      while ((assetPos = json.find("\"browser_download_url\"", assetPos)) != std::string::npos) {
+        size_t colon = json.find(':', assetPos);
+        if (colon != std::string::npos) {
+          size_t q1 = json.find('\"', colon);
+          if (q1 != std::string::npos) {
+            size_t q2 = json.find('\"', q1 + 1);
+            if (q2 != std::string::npos) {
+              std::string u = json.substr(q1 + 1, q2 - q1 - 1);
+              if (u.find(".exe") != std::string::npos && u.find("Windows") != std::string::npos) {
+                downloadUrl = u;
+                break;
+              }
+            }
+          }
+        }
+        assetPos += 22;
+      }
+    }
+  }
+
+  if (tagName.empty() && json.empty()) {
+    if (interactive) {
+      MessageBox(GetMainHwnd(),
+                 __LOCALIZE("Не удалось проверить обновления.\nПроверьте подключение к интернету.", "sws_DLG_152"),
+                 __LOCALIZE("ReNotes - Обновление", "sws_DLG_152"),
+                 MB_OK | MB_ICONWARNING);
+    }
+    return 0;
+  }
+
+  int currentVer = RENOTES_VERSION;
+  if (latestVersion > currentVer) {
+    char msg[1024];
+    snprintf(msg, sizeof(msg),
+             __LOCALIZE_VERFMT("Доступна новая версия ReNotes: v%d!\n(У вас установлена версия: v%d)\n\nХотите скачать и запустить установщик сейчас?\n\n• «Да» — Скачать установщик и обновить\n• «Нет» — Открыть страницу релиза на GitHub\n• «Отмена» — Напомнить позже", "sws_DLG_152"),
+             latestVersion, currentVer);
+
+    int res = MessageBox(GetMainHwnd(), msg,
+                         __LOCALIZE("ReNotes - Доступно обновление", "sws_DLG_152"),
+                         MB_YESNOCANCEL | MB_ICONINFORMATION);
+    if (res == IDYES) {
+#ifdef _WIN32
+      if (!downloadUrl.empty()) {
+        char tempDir[MAX_PATH] = "";
+        GetTempPathA(sizeof(tempDir), tempDir);
+        char installerPath[MAX_PATH] = "";
+        snprintf(installerPath, sizeof(installerPath), "%ssws-renotes-v%d-setup.exe", tempDir, latestVersion);
+
+        HRESULT hr = URLDownloadToFileA(NULL, downloadUrl.c_str(), installerPath, 0, NULL);
+        if (SUCCEEDED(hr)) {
+          char readyMsg[512];
+          snprintf(readyMsg, sizeof(readyMsg),
+                   __LOCALIZE("Установщик успешно скачан!\n\nПожалуйста, закройте REAPER и нажмите «ОК» для запуска установщика.", "sws_DLG_152"));
+          MessageBox(GetMainHwnd(), readyMsg, __LOCALIZE("ReNotes - Обновление", "sws_DLG_152"), MB_OK | MB_ICONINFORMATION);
+          ShellExecuteA(NULL, "open", installerPath, NULL, NULL, SW_SHOWNORMAL);
+        } else {
+          ShellExecuteA(NULL, "open", htmlUrl.c_str(), NULL, NULL, SW_SHOWNORMAL);
+        }
+      } else {
+        ShellExecuteA(NULL, "open", htmlUrl.c_str(), NULL, NULL, SW_SHOWNORMAL);
+      }
+#else
+      ShellExecute(NULL, "open", htmlUrl.c_str(), NULL, NULL, SW_SHOWNORMAL);
+#endif
+    } else if (res == IDNO) {
+#ifdef _WIN32
+      ShellExecuteA(NULL, "open", htmlUrl.c_str(), NULL, NULL, SW_SHOWNORMAL);
+#else
+      ShellExecute(NULL, "open", htmlUrl.c_str(), NULL, NULL, SW_SHOWNORMAL);
+#endif
+    }
+  } else if (interactive) {
+    char msg[256];
+    snprintf(msg, sizeof(msg),
+             __LOCALIZE_VERFMT("У вас установлена актуальная версия ReNotes (v%d).", "sws_DLG_152"),
+             currentVer);
+    MessageBox(GetMainHwnd(), msg,
+               __LOCALIZE("ReNotes - Проверка обновлений", "sws_DLG_152"),
+               MB_OK | MB_ICONINFORMATION);
+  }
+
+  return 0;
+}
+
+void CheckReNotesUpdates(bool interactive)
+{
+  ReNotesUpdateState *st = new ReNotesUpdateState{interactive};
+#ifdef _WIN32
+  uintptr_t h = _beginthreadex(NULL, 0, ReNotesUpdateThreadProc, st, 0, NULL);
+  if (h)
+    CloseHandle((HANDLE)h);
+  else
+    delete st;
+#else
+  std::thread t(ReNotesUpdateThreadProc, st);
+  t.detach();
+#endif
+}
+
+void CheckReNotesUpdatesAction(COMMAND_T *)
+{
+  CheckReNotesUpdates(true);
+}
+
+void ToggleAutoCheckUpdatesAction(COMMAND_T *)
+{
+  g_autoCheckUpdates = !g_autoCheckUpdates;
+  WritePrivateProfileString(NOTES_INI_SEC, "AutoCheckUpdates", g_autoCheckUpdates ? "1" : "0", g_SNM_IniFn.Get());
+}
+
+int IsAutoCheckUpdatesAction(COMMAND_T *)
+{
+  return g_autoCheckUpdates ? 1 : 0;
 }
 
 void CopyRoleDistributionAction(COMMAND_T *) {
@@ -4281,6 +5152,7 @@ void ExportRolesAction(COMMAND_T *) {
                MB_OK);
     return;
   }
+  SaveActiveRoleProfile();
   char fn[SNM_MAX_PATH] = "";
   if (BrowseForSaveFile(
     __LOCALIZE("ReNotes - Экспорт ролёвки", "sws_DLG_152"),

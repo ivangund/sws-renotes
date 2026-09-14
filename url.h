@@ -1,10 +1,11 @@
 #pragma once
 
-#define SWS_URL                 "http://www.sws-extension.org"
-#define SWS_URL_DOWNLOAD        SWS_URL
-#define SWS_URL_VERSION_H       SWS_URL "/download/featured/version.h"
-#define SWS_URL_BETA_DOWNLOAD   SWS_URL "/download/pre-release/"
-#define SWS_URL_BETA_VERSION_H  SWS_URL "/download/pre-release/version.h"
+#define SWS_URL                 "https://github.com/ivangund/sws-renotes"
+#define SWS_URL_DOWNLOAD        "https://github.com/ivangund/sws-renotes/releases"
+#define SWS_URL_VERSION_H       "https://github.com/ivangund/sws-renotes/releases/latest"
+#define SWS_URL_BETA_DOWNLOAD   "https://github.com/ivangund/sws-renotes/releases"
+#define SWS_URL_BETA_VERSION_H  "https://github.com/ivangund/sws-renotes/releases"
 #define SWS_URL_HELP_DIR        SWS_URL
-#define SWS_URL_WHATSNEW        SWS_URL "/whatsnew.php"
-#define SWS_URL_BETA_WHATSNEW   SWS_URL "/download/pre-release/whatsnew.html"
+#define SWS_URL_WHATSNEW        "https://github.com/ivangund/sws-renotes/releases"
+#define SWS_URL_BETA_WHATSNEW   "https://github.com/ivangund/sws-renotes/releases"
+

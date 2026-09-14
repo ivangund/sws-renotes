@@ -405,8 +405,28 @@ static COMMAND_T s_cmdTable[] =
     CopyMarkersAction, NULL,
   },
   {
+    {DEFACCEL, "SWS/S&M: ReNotes - Скопировать маркеры с кадрами в буфер обмена"}, "S&M_COPY_RGN_MARKERS_FRAMES",
+    CopyMarkersWithFramesAction, NULL,
+  },
+  {
+    {DEFACCEL, "SWS/S&M: ReNotes - Скопировать маркеры без кадров в буфер обмена"}, "S&M_COPY_RGN_MARKERS_NO_FRAMES",
+    CopyMarkersNoFramesAction, NULL,
+  },
+  {
+    {DEFACCEL, "SWS/S&M: ReNotes - Переключить копирование кадров (вкл/выкл)"}, "S&M_TOGGLE_COPY_FRAMES",
+    ToggleCopyFramesAction, NULL, 0, IsCopyFramesAction
+  },
+  {
     {DEFACCEL, "SWS/S&M: ReNotes - Скопировать ролёвку в буфер обмена"},
     "S&M_COPY_ROLE_DISTRIBUTION", CopyRoleDistributionAction, NULL, },
+  {
+    {DEFACCEL, "SWS/S&M: ReNotes - Проверить обновления"}, "S&M_RENOTES_CHECK_UPDATES",
+    CheckReNotesUpdatesAction, NULL,
+  },
+  {
+    {DEFACCEL, "SWS/S&M: ReNotes - Переключить автопроверку обновлений (вкл/выкл)"}, "S&M_RENOTES_TOGGLE_AUTO_UPDATE",
+    ToggleAutoCheckUpdatesAction, NULL, 0, IsAutoCheckUpdatesAction
+  },
 
 	// Split ------------------------------------------------------------------
 	{ { DEFACCEL, "SWS/S&M: Split selected items at edit cursor (MIDI) or prior zero crossing (audio)" }, "S&M_SPLIT1", SplitMidiAudio, NULL, },

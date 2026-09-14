@@ -262,11 +262,21 @@ int IsHideActorList(COMMAND_T *);
 void ToggleDisplayActorInPrefix(COMMAND_T *);
 int IsDisplayActorInPrefix(COMMAND_T *);
 void CopyMarkersAction(COMMAND_T *);
+void CopyMarkersWithFramesAction(COMMAND_T *);
+void CopyMarkersNoFramesAction(COMMAND_T *);
+void ToggleCopyFramesAction(COMMAND_T *);
+int IsCopyFramesAction(COMMAND_T *);
+void CheckReNotesUpdatesAction(COMMAND_T *);
+void ToggleAutoCheckUpdatesAction(COMMAND_T *);
+int IsAutoCheckUpdatesAction(COMMAND_T *);
+void CheckReNotesUpdates(bool interactive);
 void CopyRoleDistributionAction(COMMAND_T *);
 void WriteGlobalNotesToFile();
 
 extern bool g_hideRegions;
 extern bool g_hideActorList;
+extern int g_copyTimeFormat;
+extern bool g_autoCheckUpdates;
 
 // ReaScript export
 const char* NF_GetSWSTrackNotes(MediaTrack*);

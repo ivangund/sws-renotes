@@ -162,6 +162,9 @@ find_package(LICE REQUIRED)
 find_package(TagLib REQUIRED)
 find_package(WDL REQUIRED)
 target_link_libraries(sws JNetLib::JNetLib LICE::LICE TagLib::TagLib WDL::WDL)
+if(WIN32)
+  target_link_libraries(sws winhttp urlmon)
+endif()
 
 if(USE_SYSTEM_TAGLIB)
   # maybe replace this with a proper install of taglib (eg. via vcpkg)?
