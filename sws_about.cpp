@@ -26,8 +26,10 @@
 ******************************************************************************/
 
 #include "stdafx.h"
+#include "SnM/SnM.h"
 #include "SnM/SnM_Dlg.h"
 #include "SnM/SnM_Util.h"
+#include "SnM/SnM_Notes.h"
 #include "Breeder/BR_Update.h"
 #include "version.h"
 #include "license.h"
@@ -138,7 +140,7 @@ INT_PTR WINAPI doAbout(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lParam)
 			else if (wParam == IDC_INFO)
 				WhatsNew(NULL);
 			else if (wParam == IDC_UPDATE)
-				VersionCheckDialog(hwndDlg);
+				CheckReNotesUpdates(true);
 			else if (wParam == IDCANCEL) {
 				SetStartupSearchOptions(!!IsDlgButtonChecked(hwndDlg, IDC_CHECK1), !!IsDlgButtonChecked(hwndDlg, IDC_CHECK2), 0);
 				DestroyWindow(hwndDlg);
@@ -170,7 +172,7 @@ static COMMAND_T g_commandTable[] =
 };
 static COMMAND_T g_legacyInstallCmds[] =
 {
-	{ { DEFACCEL, "SWS/BR: Check for new SWS version..." }, "BR_VERSION_CHECK", VersionCheckAction, },
+	{ { DEFACCEL, "SWS/BR: Check for new SWS version..." }, "BR_VERSION_CHECK", CheckReNotesUpdatesAction, },
 	{ {}, LAST_COMMAND, },
 };
 //!WANT_LOCALIZE_1ST_STRING_END
@@ -178,6 +180,7 @@ static COMMAND_T g_legacyInstallCmds[] =
 int AboutBoxInit()
 {
 	SWSRegisterCommands(g_commandTable);
+	SWSRegisterCommands(g_legacyInstallCmds);
 	return 1;
 }
 
@@ -213,8 +216,5 @@ static bool IsFromReaPack()
 
 void PackageInit()
 {
-	if ((s_isPackaged = IsFromReaPack()))
-		return;
-
-  s_isPackaged = true;
+	s_isPackaged = false;
 }
