@@ -748,13 +748,15 @@ std::string GetStringWithRN(const std::string &input)
 
 bool GetStringWithRN(const char* _bufIn, char* _bufOut, int _bufOutSz)
 {
-	if (!_bufOut || !_bufIn)
+	if (!_bufOut || !_bufIn || _bufOutSz <= 0)
 		return false;
 
 	int i=0, j=0;
-	while (_bufIn[i] && j < _bufOutSz)
+	while (_bufIn[i] && j < _bufOutSz - 1)
 	{
 		if (_bufIn[i] == '\n') {
+			if (j + 2 >= _bufOutSz)
+				break;
 			_bufOut[j++] = '\r';
 			_bufOut[j++] = '\n';
 		}
@@ -763,11 +765,7 @@ bool GetStringWithRN(const char* _bufIn, char* _bufOut, int _bufOutSz)
 		i++;
 	}
 
-	if (j < _bufOutSz)
-		_bufOut[j] = '\0';
-	else
-		_bufOut[_bufOutSz-1] = '\0'; // truncates, best effort..
-
+	_bufOut[j] = '\0';
 	return (j < _bufOutSz);
 }
 

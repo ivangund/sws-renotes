@@ -189,9 +189,11 @@ bool hookCommandProc2(KbdSectionInfo* sec, int cmdId, int val, int valhw, int re
 // just a dummy example, not used ATM (commented in the entry point)
 void hookPostCommandProc(int iCmd, int flag)
 {
+/*
 	WDL_FastString str;
 	str.SetFormatted(512, "hookPostCommandProc: %s, flag=%d\r\n", kbd_getTextFromCmd(iCmd, NULL), flag);
 	ShowConsoleMsg(str.Get());
+*/
 }
 
 // Returns:
@@ -485,6 +487,11 @@ static void importExtensionAPI()
 	ReaPack_GetOwner  = (decltype(ReaPack_GetOwner)) plugin_getapi("ReaPack_GetOwner");
 	ReaPack_FreeEntry = (decltype(ReaPack_FreeEntry))plugin_getapi("ReaPack_FreeEntry");
 
+	if (!TrackFX_AddByName && plugin_getapi) TrackFX_AddByName = (decltype(TrackFX_AddByName))plugin_getapi("TrackFX_AddByName");
+	if (!TrackFX_SetNamedConfigParm && plugin_getapi) TrackFX_SetNamedConfigParm = (decltype(TrackFX_SetNamedConfigParm))plugin_getapi("TrackFX_SetNamedConfigParm");
+	if (!TrackFX_GetNamedConfigParm && plugin_getapi) TrackFX_GetNamedConfigParm = (decltype(TrackFX_GetNamedConfigParm))plugin_getapi("TrackFX_GetNamedConfigParm");
+	if (!AddRemoveReaScript && plugin_getapi) AddRemoveReaScript = (decltype(AddRemoveReaScript))plugin_getapi("AddRemoveReaScript");
+
 	PackageInit();
 }
 
@@ -673,10 +680,101 @@ void ErrMsg(const char* errmsg, bool wantblabla=true)
 #define IMPAP_OPT(x)    *((void **)&(x)) = (void *)rec->GetFunc(#x);
 #define ERR_RETURN(a)   { ErrMsg(a); goto error; }
 
+#ifdef _WIN32
+#include <dbghelp.h>
+#pragma comment(lib, "dbghelp.lib")
+
+void ReNotes_LogMsg(const char* fmt, ...)
+{
+	static CRITICAL_SECTION cs;
+	static bool csInit = false;
+	if (!csInit) { InitializeCriticalSection(&cs); csInit = true; }
+	EnterCriticalSection(&cs);
+	FILE* f = fopen("C:\\Users\\proku\\renotes_debug.log", "a");
+	if (f)
+	{
+		SYSTEMTIME st;
+		GetLocalTime(&st);
+		fprintf(f, "[%02d:%02d:%02d.%03d] ", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+		va_list args;
+		va_start(args, fmt);
+		vfprintf(f, fmt, args);
+		va_end(args);
+		fprintf(f, "\n");
+		fflush(f);
+		fclose(f);
+	}
+	LeaveCriticalSection(&cs);
+}
+
+static LONG WINAPI ReNotesVectoredCrashHandler(PEXCEPTION_POINTERS pExceptionInfo)
+{
+	DWORD code = pExceptionInfo->ExceptionRecord->ExceptionCode;
+	if (code == 0xC0000005 || // Access Violation
+	    code == 0xC00000FD || // Stack Overflow
+	    code == 0xC0000409 || // Fast fail
+	    code == 0xC000001D || // Illegal Instruction
+	    code == 0xC0000025)   // Noncontinuable exception
+	{
+		FILE* f = fopen("C:\\Users\\proku\\renotes_crash.log", "a");
+		if (f)
+		{
+			SYSTEMTIME st;
+			GetLocalTime(&st);
+			fprintf(f, "\n========================================\n");
+			fprintf(f, "[%02d:%02d:%02d.%03d] CRASH DETECTED: Code=0x%08X at Address=0x%p\n",
+				st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
+				code, pExceptionInfo->ExceptionRecord->ExceptionAddress);
+
+			HMODULE hMod = NULL;
+			if (GetModuleHandleEx(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+				(LPCSTR)pExceptionInfo->ExceptionRecord->ExceptionAddress, &hMod))
+			{
+				char modName[MAX_PATH] = "";
+				GetModuleFileName(hMod, modName, sizeof(modName));
+				uintptr_t offset = (uintptr_t)pExceptionInfo->ExceptionRecord->ExceptionAddress - (uintptr_t)hMod;
+				fprintf(f, "Faulting module: %s (offset +0x%IX)\n", modName, offset);
+			}
+
+			void* stack[32];
+			WORD frames = CaptureStackBackTrace(0, 32, stack, NULL);
+			fprintf(f, "Call stack (%d frames):\n", frames);
+			for (WORD i = 0; i < frames; i++)
+			{
+				HMODULE hFrameMod = NULL;
+				char frameModName[MAX_PATH] = "unknown";
+				uintptr_t frameOffset = 0;
+				if (GetModuleHandleEx(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+					(LPCSTR)stack[i], &hFrameMod))
+				{
+					GetModuleFileName(hFrameMod, frameModName, sizeof(frameModName));
+					frameOffset = (uintptr_t)stack[i] - (uintptr_t)hFrameMod;
+				}
+				fprintf(f, "  [%02d] 0x%p (%s + 0x%IX)\n", i, stack[i], frameModName, frameOffset);
+			}
+			fprintf(f, "========================================\n\n");
+			fflush(f);
+			fclose(f);
+		}
+	}
+	return EXCEPTION_CONTINUE_SEARCH;
+}
+#else
+void ReNotes_LogMsg(const char* fmt, ...) {}
+#endif
+
 extern "C"
 {
 	REAPER_PLUGIN_DLL_EXPORT int REAPER_PLUGIN_ENTRYPOINT(REAPER_PLUGIN_HINSTANCE hInstance, reaper_plugin_info_t *rec)
 	{
+#ifdef _WIN32
+		static bool s_crashHandlerInstalled = false;
+		if (!s_crashHandlerInstalled) {
+			AddVectoredExceptionHandler(1, ReNotesVectoredCrashHandler);
+			s_crashHandlerInstalled = true;
+			ReNotes_LogMsg("ReNotes SWS plugin loaded, crash handler installed");
+		}
+#endif
 		if (!rec)
 		{
 error:
@@ -779,6 +877,10 @@ error:
 		IMPAPI(CreateTrackAudioAccessor);
 		IMPAPI(CreateTrackSend); // v5.15pre1+
 		IMPAP_OPT(CrossfadeEditor_OnCommand); // v7.40+
+		IMPAP_OPT(TrackFX_AddByName);
+		IMPAP_OPT(TrackFX_SetNamedConfigParm);
+		IMPAP_OPT(TrackFX_GetNamedConfigParm);
+		IMPAP_OPT(AddRemoveReaScript);
 		IMPAPI(CSurf_FlushUndo);
 		IMPAPI(CSurf_GoEnd);
 		IMPAPI(CSurf_OnMuteChange);

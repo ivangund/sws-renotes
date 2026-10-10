@@ -83,7 +83,7 @@ public:
 
 	int GetId() const { return m_id; }
     void SetId(int id) { m_id = id; }
-	bool IsValid() const { return GetMarkerRegionIndexFromId(m_project, m_id) >= 0; }
+	bool IsValid() const { return GetMarkerRegionIndexFromId(NULL, m_id) >= 0; }
 	const char *GetNotes() const { return m_notes.Get(); }
 	int GetNotesLength() const { return m_notes.GetLength(); }
 	void SetNotes(const char *notes) { m_notes.Set(notes); }
@@ -191,6 +191,7 @@ public:
 	void ToggleLock();
 
 	void RefreshActorList();
+	void ResetSubState();
 
     void SaveCurrentText(int _type, bool _wantUndo = true);
 	void SaveCurrentProjectNotes(bool _wantUndo = true);
@@ -223,7 +224,7 @@ private:
 	SNM_VirtualComboBox m_cbType;
     SNM_VirtualComboBox m_cbRegion;
     WDL_VirtualIconButton m_btnLock;
-    SNM_ToolbarButton m_btnImportSub, m_btnClearSubs;
+    SNM_ToolbarButton m_btnImportSub, m_btnClearSubs, m_btnVideoOverlay;
 	WDL_VirtualStaticText m_txtLabel;
 	SNM_DynSizedText m_bigNotes;
 
@@ -271,12 +272,24 @@ void ToggleAutoCheckUpdatesAction(COMMAND_T *);
 int IsAutoCheckUpdatesAction(COMMAND_T *);
 void CheckReNotesUpdates(bool interactive);
 void CopyRoleDistributionAction(COMMAND_T *);
+void ClearHighlightRolesAction(COMMAND_T *);
+void ToggleVideoOverlayAction(COMMAND_T *);
+int IsVideoOverlayAction(COMMAND_T *);
+void RefreshVideoOverlayAction(COMMAND_T *);
+void SyncSubtitlesToVideoOverlay();
 void WriteGlobalNotesToFile();
+void ReNotes_LogMsg(const char* fmt, ...);
 
 extern bool g_hideRegions;
 extern bool g_hideActorList;
 extern int g_copyTimeFormat;
 extern bool g_autoCheckUpdates;
+extern bool g_videoOverlayEnabled;
+extern bool g_videoOverlayIncludeActor;
+extern double g_videoOverlayScale;
+extern double g_videoOverlayPosY;
+extern double g_videoOverlayMaxWidth;
+extern double g_videoOverlayBgAlpha;
 
 // ReaScript export
 const char* NF_GetSWSTrackNotes(MediaTrack*);

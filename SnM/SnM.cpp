@@ -420,12 +420,24 @@ static COMMAND_T s_cmdTable[] =
     {DEFACCEL, "SWS/S&M: ReNotes - Скопировать ролёвку в буфер обмена"},
     "S&M_COPY_ROLE_DISTRIBUTION", CopyRoleDistributionAction, NULL, },
   {
+    {DEFACCEL, "SWS/S&M: ReNotes - Сбросить выделение ролей цветом"}, "S&M_CLEAR_HIGHLIGHT_ROLES",
+    ClearHighlightRolesAction, NULL,
+  },
+  {
     {DEFACCEL, "SWS/S&M: ReNotes - Проверить обновления"}, "S&M_RENOTES_CHECK_UPDATES",
     CheckReNotesUpdatesAction, NULL,
   },
   {
     {DEFACCEL, "SWS/S&M: ReNotes - Переключить автопроверку обновлений (вкл/выкл)"}, "S&M_RENOTES_TOGGLE_AUTO_UPDATE",
     ToggleAutoCheckUpdatesAction, NULL, 0, IsAutoCheckUpdatesAction
+  },
+  {
+    {DEFACCEL, "SWS/S&M: ReNotes - Переключить отображение субтитров на видео (хардсаб)"}, "S&M_RENOTES_TOGGLE_VIDEO_OVERLAY",
+    ToggleVideoOverlayAction, NULL, 0, IsVideoOverlayAction
+  },
+  {
+    {DEFACCEL, "SWS/S&M: ReNotes - Обновить субтитры на видео"}, "S&M_RENOTES_REFRESH_VIDEO_OVERLAY",
+    RefreshVideoOverlayAction, NULL
   },
 
 	// Split ------------------------------------------------------------------
